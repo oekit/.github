@@ -4,7 +4,12 @@
 
 Go 后端模块矩阵：**23 个独立发版的仓库**，从零依赖微工具库到 Hertz/Kitex 生产级生态。依赖严格自底向上，全矩阵无环。
 
-![oekit 模块矩阵 · 架构总览](https://raw.githubusercontent.com/oekit/oekit/main/docs/assets/architecture.svg)
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/oekit/oekit/main/docs/assets/architecture-dark.svg">
+    <img src="https://raw.githubusercontent.com/oekit/oekit/main/docs/assets/architecture.svg" alt="oekit 模块矩阵 · 架构总览">
+  </picture>
+</p>
 
 - 🌐 官方站点：**https://oekit.github.io/**（含 8 篇指南）
 - 📦 模块矩阵：[pkg](https://github.com/oekit/pkg)（16 合 1 微工具集）· [logx](https://github.com/oekit/logx) · [tracing](https://github.com/oekit/tracing) · [registry](https://github.com/oekit/registry) · [middleware](https://github.com/oekit/middleware) · [hertz](https://github.com/oekit/hertz) · [kitex](https://github.com/oekit/kitex) · [bootstrap](https://github.com/oekit/bootstrap) · …
