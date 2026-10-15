@@ -16,14 +16,25 @@ MODE=push
 if [ "${1:-}" = "--pr" ]; then MODE=pr; shift; fi
 [ $# -ge 1 ] || { echo "usage: $0 [--pr] <repo-dir>..." >&2; exit 1; }
 
-# repo basename → "THRESHOLD|TEST_SCRIPT|ADDITIONAL_SCRIPT"（空串=用共享默认）
-declare -A OVERRIDES=(
-  # 嵌套子模块（nacos/obs）沿用原样，根模块原本就不做覆盖率门禁
-  [ekit-bootstrap]="0|go test -race -count=1 ./...|cd nacos && go build ./... && go test -race -count=1 ./...
-cd ../obs && go build ./... && go test -race -count=1 ./..."
-  # 示例仓只构建不测试
-  [ekit-kitex-examples]="0|go build ./...|"
-)
+# 按仓覆盖（macOS bash 3.2 兼容：不用 declare -A）。
+# 未命中的仓用共享默认：覆盖率门禁 30、标准测试命令。
+get_override() { # $1=repo basename → OV_THR/OV_TSCRIPT/OV_ASCRIPT（空串=共享默认）
+  OV_THR=''; OV_TSCRIPT=''; OV_ASCRIPT=''
+  case "$1" in
+    # 嵌套子模块（nacos/obs）沿用原样，根模块原本就不做覆盖率门禁
+    ekit-bootstrap)
+      OV_THR=0
+      OV_TSCRIPT='go test -race -count=1 ./...'
+      OV_ASCRIPT='cd nacos && go build ./... && go test -race -count=1 ./...
+cd ../obs && go build ./... && go test -race -count=1 ./...'
+      ;;
+    # 示例仓只构建不测试
+    ekit-kitex-examples)
+      OV_THR=0
+      OV_TSCRIPT='go build ./...'
+      ;;
+  esac
+}
 
 render_caller() { # $1=go_version $2=threshold $3=test_script $4=additional_script
   local gover="$1" thr="$2" tscript="$3" ascript="$4"
@@ -66,13 +77,12 @@ sync_repo() {
   git -C "$dir" diff --quiet -- .github/workflows/ci.yml ||
     { echo "skip $base: ci.yml 有未提交改动"; return 0; }
 
-  local gover thr tscript ascript ov
-  gover=$(grep -m1 "go-version:" "$ci" | sed "s/.*go-version: *'\?\([^'\"]*\)'\?.*/\1/")
-  ov="${OVERRIDES[$base]:-}"
-  if [ -n "$ov" ]; then
-    thr=$(sed -n '1p' <<<"$ov" | cut -d'|' -f1)
-    tscript=$(sed -n '1p' <<<"$ov" | cut -d'|' -f2-)
-    ascript=$(sed -n '2,$p' <<<"$ov")
+  local gover thr tscript ascript
+  # 行形如 `go-version: '1.24'`；按引号切分取值（BSD sed 不支持 \?，勿用 sed BRE）
+  gover=$(grep -m1 "go-version:" "$ci" | awk -F"'" '{print $2}')
+  get_override "$base"
+  if [ -n "$OV_THR" ] || [ -n "$OV_TSCRIPT" ]; then
+    thr="$OV_THR"; tscript="$OV_TSCRIPT"; ascript="$OV_ASCRIPT"
   elif grep -q 'coverprofile' "$ci"; then
     thr=$(grep -o 'THRESHOLD=[0-9]*' "$ci" | head -1 | cut -d= -f2)
     thr=${thr:-30}; tscript=''; ascript=''
