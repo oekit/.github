@@ -21,10 +21,8 @@ if [ "${1:-}" = "--pr" ]; then MODE=pr; shift; fi
 get_override() { # $1=repo basename → OV_THR/OV_TSCRIPT/OV_ASCRIPT（空串=共享默认）
   OV_THR=''; OV_TSCRIPT=''; OV_ASCRIPT=''
   case "$1" in
-    # 嵌套子模块（nacos/obs）沿用原样，根模块原本就不做覆盖率门禁
+    # 嵌套子模块（nacos/obs）附加测试；根模块走共享默认（覆盖率门禁 30，实测 98.7%）
     ekit-bootstrap)
-      OV_THR=0
-      OV_TSCRIPT='go test -race -count=1 ./...'
       OV_ASCRIPT='cd nacos && go build ./... && go test -race -count=1 ./...
 cd ../obs && go build ./... && go test -race -count=1 ./...'
       ;;
@@ -81,8 +79,8 @@ sync_repo() {
   # 行形如 `go-version: '1.24'`；按引号切分取值（BSD sed 不支持 \?，勿用 sed BRE）
   gover=$(grep -m1 "go-version:" "$ci" | awk -F"'" '{print $2}')
   get_override "$base"
-  if [ -n "$OV_THR" ] || [ -n "$OV_TSCRIPT" ]; then
-    thr="$OV_THR"; tscript="$OV_TSCRIPT"; ascript="$OV_ASCRIPT"
+  if [ -n "$OV_THR" ] || [ -n "$OV_TSCRIPT" ] || [ -n "$OV_ASCRIPT" ]; then
+    thr="${OV_THR:-30}"; tscript="$OV_TSCRIPT"; ascript="$OV_ASCRIPT"
   elif grep -q 'coverprofile' "$ci"; then
     thr=$(grep -o 'THRESHOLD=[0-9]*' "$ci" | head -1 | cut -d= -f2)
     thr=${thr:-30}; tscript=''; ascript=''

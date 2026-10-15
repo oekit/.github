@@ -66,3 +66,10 @@ jobs:
 scripts/sync-callers.sh       # 模块仓 ci.yml → 薄调用层 批量迁移脚本
 profile/README.md             # org 首页 profile
 ```
+
+## 按仓特例速查
+
+| 仓库 | 特例 |
+|---|---|
+| `bootstrap` | `additional-script` 补测嵌套子模块（nacos/obs）；根模块走默认覆盖率门禁 30 |
+| `kitex-examples` | `test-script: go build ./...` + 关闭覆盖率门禁（示例仓无测试） |
