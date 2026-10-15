@@ -16,7 +16,7 @@ on:
         description: 'Go 版本（setup-go 语义，如 1.26 解析为最新 1.26.x）'
         required: false
         type: string
-        default: '1.27'
+        default: '1.26'
       golangci-lint-version:
         description: 'golangci-lint 版本'
         required: false
@@ -97,6 +97,8 @@ jobs:
 
       - name: govulncheck
         if: inputs.govulncheck
+        # 非阻塞报告：发现漏洞亮黄注解但不挡合并（1.24/1.25 pin 的仓 stdlib 漏洞无 backport，阻塞会常红）
+        continue-on-error: true
         run: go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 ./...
 
       - name: Check coverage threshold
