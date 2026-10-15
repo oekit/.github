@@ -1,0 +1,109 @@
+name: Go CI (shared)
+
+# oekit org 统一 Go CI 门禁（reusable workflow）。
+# 各仓库 .github/workflows/ci.yml 只保留一个薄调用层，规则统一在本仓维护：
+#   jobs:
+#     ci:
+#       uses: oekit/.github/.github/workflows/go-ci.yml@main
+#       with:
+#         go-version: '1.26'
+# 规则变更只改本文件，所有引用 @main 的仓库立即生效（激进变更请改用 tag 引用）。
+
+on:
+  workflow_call:
+    inputs:
+      go-version:
+        description: 'Go 版本（setup-go 语义，如 1.26 解析为最新 1.26.x）'
+        required: false
+        type: string
+        default: '1.26'
+      golangci-lint-version:
+        description: 'golangci-lint 版本'
+        required: false
+        type: string
+        default: v2.14.0
+      coverage-threshold:
+        description: '总覆盖率下限（百分比）；0 = 关闭覆盖率门禁'
+        required: false
+        type: number
+        default: 30
+      test-script:
+        description: '测试命令；产物含 coverage.out 时自动接覆盖率门禁'
+        required: false
+        type: string
+        default: 'go test -race -count=1 -coverprofile=coverage.out ./...'
+      additional-script:
+        description: '测试后的附加检查（多行 shell），如嵌套子模块测试'
+        required: false
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ inputs.go-version }}
+          cache: true
+
+      - name: Check formatting
+        run: |
+          if [ -n "$(gofmt -l . | grep -v vendor)" ]; then
+            echo "以下文件需要格式化（请运行 make fmt）："
+            gofmt -l . | grep -v vendor
+            exit 1
+          fi
+
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@v7
+        with:
+          version: ${{ inputs.golangci-lint-version }}
+          args: --timeout 5m
+
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ inputs.go-version }}
+          cache: true
+
+      - name: Go vet
+        run: go vet ./...
+
+      - name: Run tests
+        run: ${{ inputs.test-script }}
+
+      - name: Run additional checks
+        if: inputs.additional-script != ''
+        run: ${{ inputs.additional-script }}
+
+      - name: Check coverage threshold
+        if: inputs.coverage-threshold > 0 && hashFiles('coverage.out') != ''
+        run: |
+          COVERAGE=$(go tool cover -func=coverage.out | tail -1 | awk '{print $3}' | tr -d '%')
+          echo "Total coverage: ${COVERAGE}%"
+          THRESHOLD=${{ inputs.coverage-threshold }}
+          if [ -n "$COVERAGE" ] && [ "$(echo "$COVERAGE < $THRESHOLD" | bc -l)" -eq 1 ]; then
+            echo "覆盖率 ${COVERAGE}% 低于阈值 ${THRESHOLD}%"
+            exit 1
+          fi
+
+      - name: Upload coverage
+        if: hashFiles('coverage.out') != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: coverage.out
