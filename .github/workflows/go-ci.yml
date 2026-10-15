@@ -37,6 +37,11 @@ on:
         required: false
         type: string
         default: ''
+      govulncheck:
+        description: '是否运行 govulncheck 漏洞扫描（阻塞门禁；扫描用 CI 工具链，stdlib 修复随补丁版自愈）'
+        required: false
+        type: boolean
+        default: true
 
 permissions:
   contents: read
@@ -89,6 +94,10 @@ jobs:
       - name: Run additional checks
         if: inputs.additional-script != ''
         run: ${{ inputs.additional-script }}
+
+      - name: govulncheck
+        if: inputs.govulncheck
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 ./...
 
       - name: Check coverage threshold
         if: inputs.coverage-threshold > 0 && hashFiles('coverage.out') != ''

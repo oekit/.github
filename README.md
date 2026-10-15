@@ -9,7 +9,7 @@ oekit org 的 GitHub 统一规则仓：org profile + **全 org 共享的 CI 门�
 
 ### `go-ci.yml` — Go 统一 CI 门禁
 
-步骤：gofmt 检查 → golangci-lint → `go vet` → 测试（race）→ 覆盖率门禁 → coverage 产物上传。
+步骤：gofmt 检查 → golangci-lint → `go vet` → 测试（race）→ govulncheck 漏洞扫描 → 覆盖率门禁 → coverage 产物上传。
 
 | input | 默认 | 说明 |
 |---|---|---|
@@ -18,6 +18,7 @@ oekit org 的 GitHub 统一规则仓：org profile + **全 org 共享的 CI 门�
 | `coverage-threshold` | `30` | 总覆盖率下限（%）；`0` = 关闭门禁 |
 | `test-script` | `go test -race -count=1 -coverprofile=coverage.out ./...` | 测试命令；产出 `coverage.out` 即自动接门禁 |
 | `additional-script` | `''` | 测试后的附加检查（多行 shell），如嵌套子模块 |
+| `govulncheck` | `true` | govulncheck 漏洞扫描（pin v1.9.0，阻塞门禁）；扫描用 CI 工具链，stdlib 漏洞随补丁版自愈 |
 
 ### 模块仓库接入方式
 
