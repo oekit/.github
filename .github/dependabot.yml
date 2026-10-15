@@ -1,8 +1,12 @@
 version: 2
 updates:
-  # 共享 CI 自身的 action 依赖在这里统一升级：
+  # 共享 CI 自身的 action 依赖在这里统一升级（全量分组，weekly 单 PR）：
   # 本仓 merge 后，所有引用 oekit/.github@main 的仓库立即生效。
   - package-ecosystem: github-actions
     directory: /
     schedule:
       interval: weekly
+    groups:
+      gh-actions:
+        patterns:
+          - "*"
