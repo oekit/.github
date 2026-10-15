@@ -16,7 +16,7 @@ on:
         description: 'Go 版本（setup-go 语义，如 1.26 解析为最新 1.26.x）'
         required: false
         type: string
-        default: '1.26'
+        default: '1.27'
       golangci-lint-version:
         description: 'golangci-lint 版本'
         required: false

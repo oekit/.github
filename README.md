@@ -13,7 +13,7 @@ oekit org 的 GitHub 统一规则仓：org profile + **全 org 共享的 CI 门�
 
 | input | 默认 | 说明 |
 |---|---|---|
-| `go-version` | `'1.26'` | setup-go 语义，如 `1.26` 解析为最新 1.26.x |
+| `go-version` | `'1.27'` | setup-go 语义，如 `1.27` 解析为最新 1.27.x（默认即最新 stable，stdlib 安全修复随补丁自愈）|
 | `golangci-lint-version` | `v2.14.0` | golangci-lint 版本 |
 | `coverage-threshold` | `30` | 总覆盖率下限（%）；`0` = 关闭门禁 |
 | `test-script` | `go test -race -count=1 -coverprofile=coverage.out ./...` | 测试命令；产出 `coverage.out` 即自动接门禁 |
