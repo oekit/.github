@@ -1,0 +1,12 @@
+{
+    "name": "Run a continuous integration test",
+    "description": "Validate your code using a CI workflow.",
+    "iconName": "octicon check-circle",
+    "categories": [
+        "continuous-integration",
+        "Go"
+    ],
+    "filePatterns": [
+        "go.mod$"
+    ]
+}

@@ -1,0 +1,87 @@
+name: Auto-assign issues
+
+# 新 issue 自动分配给维护者：开 issue 即有人跟进，避免掉进无人区。
+# 同时作为 reusable（workflow_call），模块仓可薄调用复用同一套规则。
+# 规则变更只改本文件，引用 @main 的仓库立即生效。
+
+on:
+  issues:
+    types: [opened]
+  workflow_call:
+    inputs:
+      assignees:
+        description: '默认受理人 GitHub login，逗号分隔'
+        required: false
+        type: string
+        default: 'zy84338719'
+      skip-if-assigned:
+        description: 'issue 已有 assignee 时是否跳过'
+        required: false
+        type: boolean
+        default: true
+
+permissions:
+  issues: write
+  contents: read
+
+concurrency:
+  group: issue-assign-${{ github.event.issue.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  assign:
+    name: Assign
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Auto-assign maintainers
+        uses: actions/github-script@v7
+        env:
+          # workflow_call 走 inputs；直接 issues 事件用同一默认
+          ASSIGNEES: ${{ inputs.assignees || 'zy84338719' }}
+          # 仅当 caller 显式传 false 才覆盖；issues 事件 / 默认路径一律 true
+          SKIP_IF_ASSIGNED: ${{ inputs.skip-if-assigned == false && 'false' || 'true' }}
+        with:
+          script: |
+            const issue = context.payload.issue;
+            if (!issue) {
+              core.info('非 issue 事件，跳过');
+              return;
+            }
+
+            const assignees = (process.env.ASSIGNEES || '')
+              .split(',')
+              .map(s => s.trim())
+              .filter(Boolean);
+            if (assignees.length === 0) {
+              core.info('未配置 assignees，跳过');
+              return;
+            }
+
+            const existing = (issue.assignees || []).map(a => a.login);
+            const skipIfAssigned = String(process.env.SKIP_IF_ASSIGNED) === 'true';
+            if (skipIfAssigned && existing.length > 0) {
+              core.info(`issue 已有 assignee (${existing.join(', ')})，跳过`);
+              return;
+            }
+
+            // 过滤掉已分配的，避免重复请求
+            const toAdd = assignees.filter(a => !existing.includes(a));
+            if (toAdd.length === 0) {
+              core.info('目标受理人均已分配，跳过');
+              return;
+            }
+
+            // bot 开的 issue（dependabot 等）不必塞给维护者
+            if (issue.user && issue.user.type === 'Bot') {
+              core.info(`由 bot ${issue.user.login} 创建，跳过`);
+              return;
+            }
+
+            await github.rest.issues.addAssignees({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: issue.number,
+              assignees: toAdd,
+            });
+            core.info(`已分配 ${toAdd.join(', ')} → #${issue.number}`);

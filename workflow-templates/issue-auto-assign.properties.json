@@ -1,0 +1,8 @@
+{
+    "name": "Auto-assign new issues",
+    "description": "Try automatically assigning work with GitHub Actions.",
+    "iconName": "octicon person",
+    "categories": [
+        "Automation"
+    ]
+}

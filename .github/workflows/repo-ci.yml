@@ -1,0 +1,112 @@
+name: Repo CI
+
+# 本仓（规则本体）的持续集成：脚本可执行性 + YAML 语法。
+# go-ci.yml 是下发给模块仓的 Go 门禁；这里管的是规则仓自己的壳。
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: repo-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  scripts:
+    name: Scripts
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Python syntax
+        run: |
+          set -euo pipefail
+          fail=0
+          while IFS= read -r f; do
+            echo "::group::py_compile ${f}"
+            if ! python3 -m py_compile "$f"; then
+              fail=1
+            fi
+            echo "::endgroup::"
+          done < <(find scripts -name '*.py' | sort)
+          exit "$fail"
+
+      - name: Shell syntax
+        run: |
+          set -euo pipefail
+          fail=0
+          while IFS= read -r f; do
+            echo "::group::bash -n ${f}"
+            if ! bash -n "$f"; then
+              fail=1
+            fi
+            echo "::endgroup::"
+          done < <(find scripts -name '*.sh' | sort)
+          exit "$fail"
+
+      - name: sync-projects.py smoke (dry-run help)
+        run: |
+          python3 scripts/sync-projects.py --help >/dev/null
+          python3 -c "import ast, pathlib; ast.parse(pathlib.Path('scripts/sync-projects.py').read_text())"
+
+  yaml:
+    name: YAML
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: YAML parse (workflows + templates + dependabot)
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import sys
+          from pathlib import Path
+
+          try:
+              import yaml
+          except ImportError:
+              import subprocess
+              subprocess.check_call([sys.executable, '-m', 'pip', 'install', '-q', 'pyyaml'])
+              import yaml
+
+          roots = [
+              Path('.github/workflows'),
+              Path('.github'),
+              Path('workflow-templates'),
+              Path('templates'),
+          ]
+          patterns = ('*.yml', '*.yaml')
+          files = []
+          for r in roots:
+              if not r.exists():
+                  continue
+              for p in patterns:
+                  files.extend(r.rglob(p))
+          files = sorted(set(files))
+          if not files:
+              print('no yaml files found')
+              sys.exit(1)
+
+          failed = 0
+          for f in files:
+              try:
+                  list(yaml.safe_load_all(f.read_text(encoding='utf-8')))
+                  print(f'OK   {f}')
+              except Exception as e:
+                  print(f'FAIL {f}: {e}')
+                  failed = 1
+          sys.exit(failed)
+          PY

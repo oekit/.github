@@ -6,17 +6,17 @@ name: Go CI (shared)
 #     ci:
 #       uses: oekit/.github/.github/workflows/go-ci.yml@main
 #       with:
-#         go-version: '1.26'
+#         go-version: '1.24'
 # 规则变更只改本文件，所有引用 @main 的仓库立即生效（激进变更请改用 tag 引用）。
 
 on:
   workflow_call:
     inputs:
       go-version:
-        description: 'Go 版本（setup-go 语义，如 1.26 解析为最新 1.26.x）'
+        description: 'Go 版本（setup-go 语义，如 1.24 解析为最新 1.24.x）'
         required: false
         type: string
-        default: '1.26'
+        default: '1.24'
       golangci-lint-version:
         description: 'golangci-lint 版本'
         required: false

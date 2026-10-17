@@ -28,6 +28,44 @@ PR 模板 ──► 各仓 PR ──► PR 审查队列 (待审→可合入)
 
 细则见 [CONTRIBUTING.md](CONTRIBUTING.md)。
 
+## 大盘自动化同步
+
+GitHub Projects **不会**自动纳入 org 下新开的 issue/PR，也不会跟进 tag。本仓提供定时同步：
+
+| 通道 | 做什么 |
+|---|---|
+| `scripts/sync-projects.py` | 统一同步四块大盘（可 `--only 1..4` 单跑、默认 dry-run、`--apply` 写入） |
+| `.github/workflows/issue-project-sync.yml` | 每 2 小时 + 手动触发，跑 `sync-projects.py --apply` |
+
+同步规则：
+
+1. **Issue 大盘** — org issue 缺则 `item-add`；`state=open→Todo / closed→Done`；Kind 按标题粗分（Bug/Enhancement/Refactor/Docs/Chore，已填不覆盖）
+2. **版本大盘** — 各模块最新 `vX.Y.Z` tag → `Latest`/`Prior`（按 draft 行标题里的模块名对齐）
+3. **矩阵健康** — 远端 README 安装行 vs 最新 tag → `Hygiene`（全绿 / 有漂移 / 待审计）+ `Drift`
+4. **PR 审查队列** — org PR 缺则入队；`open→待审 / merged→已合入`；Scope 按标题粗分
+
+### 前置：`OEKIT_PROJECT_TOKEN`
+
+Actions 的 `GITHUB_TOKEN` 没有 `project` scope，需在 org secrets 配 PAT / GitHub App token：
+
+```bash
+# 生成（或用已有带 project 权限的 PAT）
+gh auth refresh -s project
+# Settings → Secrets and variables → Actions → New repository secret
+# Name: OEKIT_PROJECT_TOKEN
+```
+
+权限要求：`project` + `read:org`。
+
+### 各板视图
+
+| 大盘 | 视图 |
+|---|---|
+| Issue 大盘 | 总览 · 开启(`status:Todo`) · 关闭(`status:Done`) · 看板 · 按模块 · 按类型 |
+| 版本大盘 | 总览 · 按层级(Board) · 嵌套模块(`nested:*`) · 近期变更 |
+| 矩阵健康 | 总览 · 有漂移 · 全绿 · 待审计 · 看板 |
+| PR 审查队列 | 总览 · 待审 · 审阅中 · 已合入 · 看板 · 按 Scope |
+
 ## 共享 workflow
 
 ### `go-ci.yml` — Go 统一 CI 门禁
@@ -38,7 +76,7 @@ PR 模板 ──► 各仓 PR ──► PR 审查队列 (待审→可合入)
 
 | input | 默认 | 说明 |
 |---|---|---|
-| `go-version` | `'1.26'` | setup-go 语义，如 `1.26` 解析为最新 1.26.x |
+| `go-version` | `'1.24'` | setup-go 语义，如 `1.24` 解析为最新 1.24.x（全 org 统一地板 1.24）|
 | `golangci-lint-version` | `v2.14.0` | golangci-lint 版本 |
 | `coverage-threshold` | `30` | 总覆盖率下限（%）；`0` = 关闭门禁 |
 | `test-script` | `go test -race -count=1 -coverprofile=coverage.out ./...` | 根模块测试命令；产出 `coverage.out` 即自动接门禁 |
@@ -67,10 +105,45 @@ jobs:
     name: Lint & Test
     uses: oekit/.github/.github/workflows/go-ci.yml@main
     with:
-      go-version: '1.26'
+      go-version: '1.24'
 ```
 
 只写与共享默认不同的参数；与默认一致的字段省略。
+
+### `issue-auto-assign.yml` — 新 issue 自动分配
+
+新开 issue 自动分配给维护者，避免掉进无人区。本仓 `issues: opened` 即触发；模块仓可薄调用复用。
+
+| input | 默认 | 说明 |
+|---|---|---|
+| `assignees` | `'zy84338719'` | 受理人 GitHub login，逗号分隔可多人 |
+| `skip-if-assigned` | `true` | issue 已有 assignee 时跳过 |
+
+规则：bot 开的 issue（dependabot 等）跳过；已分配过的 login 不重复添加。
+
+```yaml
+# 模块仓薄调用（可选——不接就用 org 默认模板或手写）
+jobs:
+  assign:
+    uses: oekit/.github/.github/workflows/issue-auto-assign.yml@main
+    with:
+      assignees: 'zy84338719'
+```
+
+### `repo-ci.yml` — 规则仓自身 CI
+
+规则本体的持续集成：`scripts/*.py` 语法与入口 smoke、`scripts/*.sh` bash 语法、workflow/模板 YAML 可解析。与 `workflow-lint.yml`（actionlint）互补。
+
+### 组织 workflow 模板（`workflow-templates/`）
+
+新仓 **Actions → New workflow** 时可直接选用：
+
+| 模板 | 用途 |
+|---|---|
+| `issue-auto-assign.yml` | Auto-assign new issues — 自动把新 issue 分给维护者 |
+| `go-ci.yml` | Run a continuous integration test — 薄调用共享 Go CI 门禁 |
+
+`$default-branch` 占位符在创建时会替换为该仓默认分支。
 
 ## 引用 ref 策略
 
@@ -83,6 +156,8 @@ jobs:
 - **改规则**：直接改本仓 `.github/workflows/go-ci.yml`，merge 即生效，无需动模块仓。
 - **升级 action 版本**：本仓 dependabot（`github-actions` ecosystem，weekly）提 PR，merge 即全 org 生效。
 - **改治理大盘联动**：issue/PR 模板与 CONTRIBUTING 里的 Projects 链接/字段名；项目号（1/4）是稳定 ID，换板才需要改。
+- **手动补同步**：`python3 scripts/sync-projects.py --apply`（或 Actions → 大盘同步 → Run workflow）。
+- **同步未生效**：检查 `OEKIT_PROJECT_TOKEN` 是否过期 / 是否有 `project` scope。
 - **新增仓库**：拷上面的接入模板，改 `go-version` 即可；或跑
   `scripts/sync-callers.sh <repo-dir>` 从旧版完整 ci.yml 自动生成薄调用层
   （`--pr` 走 PR 模式）。
@@ -90,18 +165,24 @@ jobs:
 ## 目录
 
 ```
-.github/workflows/go-ci.yml          # 共享 reusable workflow（规则本体）
-.github/workflows/workflow-lint.yml  # 本仓 Actions 语法自检（actionlint）
-.github/dependabot.yml               # 本仓 action 依赖自动升级
-.github/ISSUE_TEMPLATE/              # org 默认 issue 模板（bug / feature / docs / config）
-.github/PULL_REQUEST_TEMPLATE.md     # org 默认 PR 模板（含入队 checklist）
-profile/README.md                    # org 首页 profile（含治理大盘入口）
-CONTRIBUTING.md                      # 全 org 贡献流程 + 大盘联动约定
-SECURITY.md                          # 安全策略 / 私密披露
-SUPPORT.md                           # 支持渠道索引
-scripts/sync-callers.sh              # 模块仓 ci.yml → 薄调用层 批量迁移脚本
-scripts/sync-dependabot.sh           # 模块仓 dependabot 批量同步
-templates/dependabot-gomod.yml       # 模块仓 dependabot 模板
+.github/workflows/go-ci.yml              # 共享 reusable workflow（Go 门禁规则本体）
+.github/workflows/issue-auto-assign.yml  # 新 issue 自动分配（可 reusable）
+.github/workflows/repo-ci.yml            # 规则仓自身脚本/YAML CI
+.github/workflows/workflow-lint.yml      # 本仓 Actions 语法自检（actionlint）
+.github/workflows/issue-project-sync.yml # 大盘定时同步 workflow
+.github/dependabot.yml                   # 本仓 action 依赖自动升级
+.github/ISSUE_TEMPLATE/                  # org 默认 issue 模板（bug / feature / docs / config）
+.github/PULL_REQUEST_TEMPLATE.md         # org 默认 PR 模板（含入队 checklist）
+workflow-templates/issue-auto-assign.yml # 组织模板：新 issue 自动分配
+workflow-templates/go-ci.yml             # 组织模板：Go CI 薄调用层
+profile/README.md                        # org 首页 profile（含治理大盘入口）
+CONTRIBUTING.md                          # 全 org 贡献流程 + 大盘联动约定
+SECURITY.md                              # 安全策略 / 私密披露
+SUPPORT.md                               # 支持渠道索引
+scripts/sync-projects.py                 # 四块治理大盘统一同步（issue/PR/tag → Projects）
+scripts/sync-callers.sh                  # 模块仓 ci.yml → 薄调用层 批量迁移脚本
+scripts/sync-dependabot.sh               # 模块仓 dependabot 批量同步
+templates/dependabot-gomod.yml           # 模块仓 dependabot 模板
 ```
 
 ## 按仓特例速查

@@ -1,0 +1,30 @@
+name: 大盘同步
+
+# org issue / PR / tag ↔ 四块 GitHub Projects 大盘自动对齐。
+# Projects v2 不会自动纳入跨仓 issue/PR，也不会跟进 tag——定时补齐。
+
+on:
+  schedule:
+    # 每 2 小时一次（避开整点）
+    - cron: '17 */2 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: read
+  pull-requests: read
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Sync all boards
+        env:
+          # GITHUB_TOKEN 默认无 project scope，走 PAT / GitHub App token。
+          # 所需权限：project（读写）+ read:org
+          GH_TOKEN: ${{ secrets.OEKIT_PROJECT_TOKEN }}
+          ORG: oekit
+        run: |
+          python3 scripts/sync-projects.py --apply
