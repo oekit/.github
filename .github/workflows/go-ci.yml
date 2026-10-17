@@ -94,9 +94,10 @@ jobs:
 
       - name: Check formatting
         run: |
-          if [ -n "$(gofmt -l . | grep -v vendor)" ]; then
+          unformatted=$(gofmt -l . | grep -v vendor || true)
+          if [ -n "$unformatted" ]; then
             echo "以下文件需要格式化（请运行 make fmt）："
-            gofmt -l . | grep -v vendor
+            echo "$unformatted"
             exit 1
           fi
 
@@ -156,10 +157,12 @@ jobs:
         run: |
           set -o pipefail
           go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 ./... 2>&1 | tee govulncheck.txt
-          echo "## govulncheck" >> "$GITHUB_STEP_SUMMARY"
-          echo '```' >> "$GITHUB_STEP_SUMMARY"
-          tail -n 40 govulncheck.txt >> "$GITHUB_STEP_SUMMARY"
-          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          {
+            echo "## govulncheck"
+            echo '```'
+            tail -n 40 govulncheck.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Check coverage threshold
         if: inputs.coverage-threshold > 0 && hashFiles('coverage.out') != ''
