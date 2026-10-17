@@ -1,0 +1,17 @@
+blank_issues_enabled: true
+contact_links:
+  - name: oekit 官方站点
+    url: https://oekit.github.io/
+    about: 指南、架构总览、llms.txt——提问前先查文档
+  - name: Issue 大盘
+    url: https://github.com/orgs/oekit/projects/1
+    about: 跨仓 issue 统一视图（Status × Kind × Repository）
+  - name: 版本大盘
+    url: https://github.com/orgs/oekit/projects/2
+    about: 查各模块最新 tag / 上一版 / 嵌套模块
+  - name: 矩阵健康
+    url: https://github.com/orgs/oekit/projects/3
+    about: 安装行对齐、文档/门面壳卫生巡检
+  - name: 安全漏洞（私密）
+    url: https://github.com/oekit/.github/blob/main/SECURITY.md
+    about: 请勿公开披露——走私密漏洞报告

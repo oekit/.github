@@ -1,0 +1,35 @@
+name: 文档问题
+description: README / 指南 / godoc / llms.txt 缺口或与实现不符
+title: "[docs] 简述缺口（例：[migration] 路径映射表缺 config→core）"
+labels: ["docs"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        文档类问题进 [Issue 大盘](https://github.com/orgs/oekit/projects/1)（Kind=Docs）。
+        站点源码在 [oekit/oekit.github.io](https://github.com/oekit/oekit.github.io)。
+  - type: dropdown
+    id: where
+    attributes:
+      label: 位置
+      options:
+        - 模块 README / AGENTS.md
+        - 模块 godoc
+        - oekit.github.io 指南
+        - llms.txt / AI Agent 文档
+        - 迁移指南
+        - 其他
+    validations:
+      required: true
+  - type: textarea
+    id: mismatch
+    attributes:
+      label: 与实现不符 / 缺失之处
+      description: 请给出「文档原话 vs 实际行为」的对照；版本号很有帮助。
+    validations:
+      required: true
+  - type: textarea
+    id: suggestion
+    attributes:
+      label: 建议改法
+      description: 期望补什么、改哪一句。

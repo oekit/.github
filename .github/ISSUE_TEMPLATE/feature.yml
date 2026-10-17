@@ -1,0 +1,42 @@
+name: 特性 / 增强
+description: 新能力、API 增强、语义扩展
+title: "[模块] 简述诉求（例：[retry] 支持指数退避）"
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        提交后进入 [Issue 大盘](https://github.com/orgs/oekit/projects/1)（Kind=Enhancement）。
+        跨模块/矩阵拓扑类改动请开在 [oekit/oekit](https://github.com/oekit/oekit)。
+  - type: input
+    id: module
+    attributes:
+      label: 目标模块
+      description: 单模块就写模块名；跨模块写多个并说明依赖方向。
+      placeholder: "concurrency/retry"
+    validations:
+      required: true
+  - type: textarea
+    id: scenario
+    attributes:
+      label: 场景与痛点
+      description: 真实消费方场景是什么？现在为什么接不进去/要手搓？
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: 提议 API / 行为
+      description: 草案签名、选项名、默认值、兼容性说明（0.x 可 breaking，但请写清）。
+    validations:
+      required: true
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: 验收
+      description: 怎样算完成？可观察的测试/语义契约。
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: 已考虑的替代
+      description: 为什么不用别的做法？（调用方包一层、内部 helper 等）

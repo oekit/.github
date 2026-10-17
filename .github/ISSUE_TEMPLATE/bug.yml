@@ -1,0 +1,47 @@
+name: Bug 报告
+description: 行为不符合文档/预期——含复现与版本
+title: "[模块] 简述现象（例：[logx] error 值渲染为 {}）"
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        提交后本 issue 会进入 [Issue 大盘](https://github.com/orgs/oekit/projects/1)。
+        标题请保留 `[模块]` 前缀，大盘按 Repository/Kind 分组更准。
+  - type: input
+    id: module
+    attributes:
+      label: 模块与版本
+      description: "模块路径 + 版本，如 `github.com/oekit/logx@v0.3.0`（`go list -m` 可查）"
+      placeholder: "github.com/oekit/logx@v0.3.0"
+    validations:
+      required: true
+  - type: textarea
+    id: current
+    attributes:
+      label: 现状
+      description: 实际行为；给最小复现（代码 / 日志 / 命令）。
+      placeholder: |
+        ```go
+        // 最小复现
+        ```
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: 期望行为
+      description: 文档承诺或你认为正确的语义。
+    validations:
+      required: true
+  - type: textarea
+    id: impact
+    attributes:
+      label: 影响面
+      description: 谁会踩到？静默错误还是 panic？有无数据丢失/安全面？
+  - type: textarea
+    id: env
+    attributes:
+      label: 环境
+      description: Go 版本、OS、其他相关依赖版本。
+      placeholder: "go1.27.0 · darwin/arm64"
