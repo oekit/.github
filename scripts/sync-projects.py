@@ -267,7 +267,8 @@ def sync_issue_board(apply: bool) -> None:
     adds: list[dict] = []
     syncs: list[tuple[str, str, str, str | None]] = []
     for iss in issues:
-        want_status = "Todo" if iss["state"] == "OPEN" else "Done"
+        # gh search 返回小写 open/closed，GraphQL 是大写 OPEN/CLOSED——统一不敏感比较
+        want_status = "Todo" if iss["state"].upper() == "OPEN" else "Done"
         want_kind = infer_kind(iss["title"])
         if iss["url"] not in by_url:
             adds.append({**iss, "want_status": want_status, "want_kind": want_kind})
@@ -359,7 +360,8 @@ def sync_pr_board(apply: bool) -> None:
     adds: list[dict] = []
     syncs: list[tuple[str, str, str, str | None]] = []
     for pr in prs:
-        want_review = "待审" if pr["state"] == "OPEN" else "已合入"
+        # gh search prs 返回小写 open/merged/closed
+        want_review = "待审" if pr["state"].upper() == "OPEN" else "已合入"
         want_scope = infer_scope(pr["title"])
         if pr["url"] not in by_url:
             adds.append({**pr, "want_review": want_review, "want_scope": want_scope})
@@ -370,6 +372,8 @@ def sync_pr_board(apply: bool) -> None:
 
     for a in adds:
         print(f"  + {a['url']}  {a['want_review']}/{a['want_scope']}")
+    for _, title, review, scope in syncs:
+        print(f"  ~ {title[:48]}  → {review} {scope or ''}")
     if not apply:
         print("  (dry-run)")
         return
