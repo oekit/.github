@@ -42,6 +42,11 @@ on:
         required: false
         type: boolean
         default: true
+      tidy-check:
+        description: '是否运行 go mod tidy -diff 门禁（检测 go.mod/go.sum 漂移：指向已删 tag 的版本地板、旧 import 路径、排序不规范等）'
+        required: false
+        type: boolean
+        default: true
 
 permissions:
   contents: read
@@ -58,6 +63,10 @@ jobs:
         with:
           go-version: ${{ inputs.go-version }}
           cache: true
+
+      - name: Check go mod tidy
+        if: inputs.tidy-check
+        run: go mod tidy -diff
 
       - name: Check formatting
         run: |
