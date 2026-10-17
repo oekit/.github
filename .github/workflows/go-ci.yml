@@ -28,17 +28,22 @@ on:
         type: number
         default: 30
       test-script:
-        description: '测试命令；产物含 coverage.out 时自动接覆盖率门禁'
+        description: '根模块测试命令；产物含 coverage.out 时自动接覆盖率门禁'
         required: false
         type: string
         default: 'go test -race -count=1 -coverprofile=coverage.out ./...'
       additional-script:
-        description: '测试后的附加检查（多行 shell），如嵌套子模块测试'
+        description: '测试后的附加检查（多行 shell）；嵌套模块默认已自动测试，这里只放特例'
         required: false
         type: string
         default: ''
+      test-nested:
+        description: '是否自动发现并测试嵌套 go.mod 子模块（build+test -race）'
+        required: false
+        type: boolean
+        default: true
       govulncheck:
-        description: '是否运行 govulncheck 漏洞扫描（阻塞门禁；扫描用 CI 工具链，stdlib 修复随补丁版自愈）'
+        description: '是否运行 govulncheck 漏洞扫描（非阻塞报告；扫描用 CI 工具链，stdlib 修复随补丁版自愈）'
         required: false
         type: boolean
         default: true
@@ -48,6 +53,11 @@ on:
         type: boolean
         default: true
 
+# 同一 ref 的重复触发取消旧 run（PR 连推 / main 连推不堆叠分钟数）
+concurrency:
+  group: go-ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 permissions:
   contents: read
 
@@ -55,6 +65,7 @@ jobs:
   lint:
     name: Lint
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7
 
@@ -85,6 +96,7 @@ jobs:
   test:
     name: Test
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7
 
@@ -100,6 +112,26 @@ jobs:
       - name: Run tests
         run: ${{ inputs.test-script }}
 
+      - name: Test nested modules
+        if: inputs.test-nested
+        run: |
+          set -euo pipefail
+          found=0
+          while IFS= read -r mod; do
+            dir=$(dirname "$mod")
+            [ "$dir" = "." ] && continue
+            case "$dir" in
+              ./vendor/*|./third_party/*|./testdata/*|./examples/*|./.git/*) continue ;;
+            esac
+            found=1
+            echo "::group::nested module ${dir#./}"
+            (cd "$dir" && go build ./... && go test -race -count=1 ./...)
+            echo "::endgroup::"
+          done < <(find . -name go.mod -not -path './.git/*' | sort)
+          if [ "$found" -eq 0 ]; then
+            echo "无嵌套子模块，跳过"
+          fi
+
       - name: Run additional checks
         if: inputs.additional-script != ''
         run: ${{ inputs.additional-script }}
@@ -108,15 +140,34 @@ jobs:
         if: inputs.govulncheck
         # 非阻塞报告：发现漏洞亮黄注解但不挡合并（1.24/1.25 pin 的仓 stdlib 漏洞无 backport，阻塞会常红）
         continue-on-error: true
-        run: go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 ./...
+        run: |
+          set -o pipefail
+          go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 ./... 2>&1 | tee govulncheck.txt
+          echo "## govulncheck" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          tail -n 40 govulncheck.txt >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
 
       - name: Check coverage threshold
         if: inputs.coverage-threshold > 0 && hashFiles('coverage.out') != ''
         run: |
           COVERAGE=$(go tool cover -func=coverage.out | tail -1 | awk '{print $3}' | tr -d '%')
-          echo "Total coverage: ${COVERAGE}%"
           THRESHOLD=${{ inputs.coverage-threshold }}
-          if [ -n "$COVERAGE" ] && [ "$(echo "$COVERAGE < $THRESHOLD" | bc -l)" -eq 1 ]; then
+          echo "Total coverage: ${COVERAGE}% (threshold ${THRESHOLD}%)"
+          {
+            echo "## Coverage"
+            echo ""
+            echo "| 指标 | 值 |"
+            echo "|---|---|"
+            echo "| 总覆盖率 | ${COVERAGE}% |"
+            echo "| 门禁阈值 | ${THRESHOLD}% |"
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ -z "$COVERAGE" ]; then
+            echo "无法解析覆盖率数值"
+            exit 1
+          fi
+          if awk -v c="$COVERAGE" -v t="$THRESHOLD" 'BEGIN { exit !(c < t) }'; then
+            echo "覆盖率 ${COVERAGE}% 低于阈值 ${THRESHOLD}%" >> "$GITHUB_STEP_SUMMARY"
             echo "覆盖率 ${COVERAGE}% 低于阈值 ${THRESHOLD}%"
             exit 1
           fi
@@ -127,3 +178,4 @@ jobs:
         with:
           name: coverage
           path: coverage.out
+          retention-days: 14
