@@ -4,7 +4,7 @@
 Projects v2 不会自动跟进 org 的 issue/PR/tag，本脚本补齐：
 
   #1 Issue 大盘   — org issue → 板；Status=Todo/Done；Kind 按标题粗分
-  #2 版本大盘     — 各模块最新 tag → Latest/Prior（draft 行按模块名对齐）
+  #2 版本大盘     — 主模块/嵌套模块独立成行；Latest/Prior=近两版 tag，Parent=嵌套归属
   #3 矩阵健康     — README 安装行 vs 最新 tag → Hygiene（全绿/有漂移/待审计）
   #4 PR 审查队列  — org PR → 板；Review=待审/已合入；Scope 按标题
 
@@ -400,17 +400,65 @@ MODULES = [
     "kitex-examples",
 ]
 
+# 主模块默认 Layer（新行落板时用；嵌套行继承父级）
+LAYER_BY_MODULE = {
+    "pkg": "基础", "concurrency": "基础", "logx": "基础", "core": "基础",
+    "metrics": "基础", "tracing": "基础",
+    "registry": "治理", "nns": "治理", "nns-endpoint": "治理",
+    "data": "数据", "gormx": "数据", "redisx": "数据", "timertask": "数据",
+    "httpx": "网络", "network": "网络",
+    "middleware": "服务", "bootstrap": "服务", "hertz": "服务", "kitex": "服务",
+    "workflow": "工具", "kitex-examples": "示例",
+}
+
 
 def latest_tags(repo: str) -> list[str]:
-    """Return recent tags, newest first (root tags only, no nested prefixes)."""
+    """Return recent root tags, newest first (vX.Y.Z only)."""
     raw = subprocess.check_output(
-        ["gh", "api", f"repos/{ORG}/{repo}/tags?per_page=10", "--jq", "[.[].name]"],
+        ["gh", "api", f"repos/{ORG}/{repo}/tags?per_page=100", "--jq", "[.[].name]"],
         text=True,
     )
     tags = json.loads(raw)
-    # keep only vX.Y.Z style root tags
     root = [t for t in tags if re.fullmatch(r"v\d+\.\d+\.\d+", t)]
     return root
+
+
+def nested_tags(repo: str) -> dict[str, list[str]]:
+    """嵌套模块 tag：path/vX.Y.Z → {path: [ver, ...] 新→旧}。"""
+    raw = subprocess.check_output(
+        ["gh", "api", f"repos/{ORG}/{repo}/tags?per_page=100", "--jq", "[.[].name]"],
+        text=True,
+    )
+    tags = json.loads(raw)
+    out: dict[str, list[str]] = {}
+    for t in tags:
+        if "/" not in t:
+            continue
+        path, ver = t.split("/", 1)
+        if re.fullmatch(r"v\d+\.\d+\.\d+", ver):
+            out.setdefault(path, []).append(ver)
+
+    def key(v: str) -> tuple[int, ...]:
+        return tuple(int(x) for x in v.lstrip("v").split("."))
+
+    for p in out:
+        out[p].sort(key=key, reverse=True)
+    return out
+
+
+def add_draft(pid: str, title: str, body: str = "") -> str:
+    esc_t = title.replace("\\", "\\\\").replace('"', '\\"')
+    esc_b = body.replace("\\", "\\\\").replace('"', '\\"')
+    data = gql(
+        f"""
+        mutation {{
+          addProjectV2DraftIssue(input: {{
+            projectId: "{pid}", title: "{esc_t}", body: "{esc_b}"
+          }}) {{ projectItem {{ id }} }}
+        }}
+        """
+    )
+    return data["addProjectV2DraftIssue"]["projectItem"]["id"]
 
 
 def remote_install_line(repo: str) -> str | None:
@@ -434,34 +482,85 @@ def remote_install_line(repo: str) -> str | None:
 
 
 def sync_version_board(apply: bool) -> None:
+    """版本矩阵：Title=模块路径，主模块与嵌套模块独立成行。
+
+    嵌套行 title 形如 `logx/hlog`，Parent=父模块名；主模块 Parent 留空。
+    """
     print("\n=== #2 版本大盘 ===")
     proj = load_project(PROJECT_VERSION)
     latest_id = proj["fields"]["Latest"]["id"]
     prior_id = proj["fields"]["Prior"]["id"]
+    parent_id = proj["fields"].get("Parent", {}).get("id")
+    layer_id = proj["fields"].get("Layer", {}).get("id")
+    layer_opts = opt_map(proj["fields"].get("Layer"))
 
+    # Title 一律精确匹配模块路径（历史 `pkg @ v0.7.0` 形式仅兼容读取）
     by_title: dict[str, dict] = {}
     for it in proj["items"]:
-        if it["title"]:
-            by_title[it["title"].split("@")[0].strip()] = it
+        if not it["title"]:
+            continue
+        key = it["title"].split("@")[0].strip()
+        by_title[key] = it
 
     updates = 0
+
+    def upsert(title: str, latest: str, prior: str, parent: str, layer: str | None) -> None:
+        nonlocal updates
+        item = by_title.get(title)
+        if not item:
+            print(f"  + {title}  {latest}/{prior or '-'}  parent={parent or '-'}")
+            updates += 1
+            if not apply:
+                return
+            iid = add_draft(proj["id"], title, f"{parent} 嵌套模块" if parent else title)
+            by_title[title] = {"id": iid, "fv": {}}
+            item = by_title[title]
+            if parent and parent_id:
+                set_field(proj["id"], iid, parent_id, text=parent)
+            if layer and layer_id and layer in layer_opts:
+                set_field(proj["id"], iid, layer_id, option_id=layer_opts[layer])
+            if latest:
+                set_field(proj["id"], iid, latest_id, text=latest)
+            if prior:
+                set_field(proj["id"], iid, prior_id, text=prior)
+            return
+
+        cur_l = item["fv"].get("Latest")
+        cur_p = item["fv"].get("Prior")
+        cur_parent = item["fv"].get("Parent")
+        need = False
+        if cur_l != latest or (prior and cur_p != prior):
+            need = True
+        if parent_id and (cur_parent or "") != (parent or ""):
+            need = True
+        if not need:
+            return
+        print(f"  ~ {title}: {cur_l}/{cur_p} → {latest}/{prior or '-'}  parent={parent or '-'}")
+        updates += 1
+        if not apply:
+            return
+        if latest:
+            set_field(proj["id"], item["id"], latest_id, text=latest)
+        if prior:
+            set_field(proj["id"], item["id"], prior_id, text=prior)
+        if parent_id:
+            set_field(proj["id"], item["id"], parent_id, text=parent or "")
+
     for mod in MODULES:
         tags = latest_tags(mod)
         if not tags:
             continue
         latest, prior = tags[0], tags[1] if len(tags) > 1 else ""
-        item = by_title.get(mod)
-        if not item:
-            print(f"  ? no board row for {mod}")
-            continue
-        cur_l, cur_p = item["fv"].get("Latest"), item["fv"].get("Prior")
-        if cur_l != latest or (prior and cur_p != prior):
-            print(f"  ~ {mod}: {cur_l}/{cur_p} → {latest}/{prior}")
-            updates += 1
-            if apply:
-                set_field(proj["id"], item["id"], latest_id, text=latest)
-                if prior:
-                    set_field(proj["id"], item["id"], prior_id, text=prior)
+        upsert(mod, latest, prior, parent="", layer=LAYER_BY_MODULE.get(mod))
+
+        # 嵌套模块独立成行（Layer 继承主模块）
+        parent_layer = (by_title.get(mod) or {}).get("fv", {}).get("Layer")
+        for path, vers in sorted(nested_tags(mod).items()):
+            ntitle = f"{mod}/{path}"
+            n_latest = vers[0] if vers else ""
+            n_prior = vers[1] if len(vers) > 1 else ""
+            upsert(ntitle, n_latest, n_prior, parent=mod, layer=parent_layer)
+
     if not updates:
         print("  all up to date")
     if not apply and updates:
