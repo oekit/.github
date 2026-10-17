@@ -39,10 +39,10 @@ GitHub Projects **不会**自动纳入 org 下新开的 issue/PR，也不会跟�
 
 同步规则：
 
-1. **Issue 大盘** — org issue 缺则 `item-add`；`state=open→Todo / closed→Done`；Kind 按标题粗分（Bug/Enhancement/Refactor/Docs/Chore，已填不覆盖）
+1. **Issue 大盘** — org issue 缺则入板；`state=open→Todo / closed→Done`；`Kind` 按标题细分（已填不覆盖）；`Module`=所属仓
 2. **版本大盘** — 主模块与嵌套模块独立成行（Title=`logx` / `logx/hlog`）；`Latest`/`Prior`=近两版 root tag；`Parent` 标嵌套归属；缺行自动补
-3. **矩阵健康** — 远端 README 安装行 vs 最新 tag → `Hygiene`（全绿 / 有漂移 / 待审计）+ `Drift`
-4. **PR 审查队列** — org PR 缺则入队；`open→待审 / merged→已合入`；Scope 按标题粗分
+3. **矩阵健康** — `Install`/`Tag` 并排对照 + `Note` 诊断；`Hygiene`（全绿 / 有漂移 / 待审计）+ `Drift` 0/1
+4. **PR 审查队列** — org PR 缺则入队；`open→待审 / merged→已合入 / closed→已关闭`；`Scope` 按 conventional commit 类型（build/deps → deps）
 
 ### 前置：`OEKIT_PROJECT_TOKEN`
 
@@ -64,7 +64,7 @@ gh auth refresh -s project
 | Issue 大盘 | 总览 · 开启(`status:Todo`) · 关闭(`status:Done`) · 看板 · 按模块 · 按类型 |
 | 版本大盘 | 总览 · 按层级(Board) · 嵌套模块(`Parent` 非空) · 近期变更 |
 | 矩阵健康 | 总览 · 有漂移 · 全绿 · 待审计 · 看板 |
-| PR 审查队列 | 总览 · 待审 · 审阅中 · 已合入 · 看板 · 按 Scope |
+| PR 审查队列 | 总览 · 待审 · 审阅中 · 可合入 · 已合入 · 已关闭 · 按 Scope |
 
 ## 共享 workflow
 

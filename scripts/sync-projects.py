@@ -3,10 +3,10 @@
 
 Projects v2 不会自动跟进 org 的 issue/PR/tag，本脚本补齐：
 
-  #1 Issue 大盘   — org issue → 板；Status=Todo/Done；Kind 按标题粗分
+  #1 Issue 大盘   — org issue → 板；Status=Todo/Done；Kind 按标题细分；Module=所属仓
   #2 版本大盘     — 主模块/嵌套模块独立成行；Latest/Prior=近两版 tag，Parent=嵌套归属
-  #3 矩阵健康     — README 安装行 vs 最新 tag → Hygiene（全绿/有漂移/待审计）
-  #4 PR 审查队列  — org PR → 板；Review=待审/已合入；Scope 按标题
+  #3 矩阵健康     — Install/Tag 并排 + Note 诊断；Hygiene（全绿/有漂移/待审计）+ Drift
+  #4 PR 审查队列  — org PR → 板；Review=待审/已合入/已关闭；Scope 按 CC 类型
 
 用法：
   python3 scripts/sync-projects.py --apply           # 全量
@@ -215,19 +215,48 @@ def opt_map(field: dict | None) -> dict[str, str]:
 # ---------------------------------------------------------------------------
 
 TITLE_KIND_RULES: list[tuple[re.Pattern[str], str]] = [
-    (re.compile(r"\[(docs|migration|readme|godoc|llms|site|docs/)", re.I), "Docs"),
-    (re.compile(r"\[(refactor|matrix|chore|deps|ci)\]", re.I), "Chore"),
-    (re.compile(r"fix\(|\[fix\]|\[bug\]|不存在|静默|崩溃|越权|丢失|不一致|炸", re.I), "Bug"),
-    (re.compile(r"建议|支持|提供|增强|缺|诉求|选项|变体|模式|门禁|防护|钩子|特性", re.I), "Enhancement"),
-    (re.compile(r"归位|拆|下线|收编|迁", re.I), "Refactor"),
+    # Docs：显式 docs 前缀 / 指南 / 说明 / 文档类
+    (re.compile(r"\[(docs|migration|readme|godoc|llms|site|docs/|llms\.txt)\]|指南|说明|文档|README|CONTRIBUTING|AGENTS|注释", re.I), "Docs"),
+    # Bug：破坏不变量 / 泄露 / panic / 与文档矛盾 / 静默失败
+    (re.compile(
+        r"fix\(|\[fix\]|\[bug\]|不存在|静默|崩溃|越权|丢失|不一致|炸|泄露|泄漏|泄进|破坏|矛盾|陷阱|panic|绕过|折叠|误"
+        r"|残留|过期|不去重|撞车|无人引用|重复执行|仍是|仍写",
+        re.I,
+    ), "Bug"),
+    # Refactor：归位 / 拆 / 迁 / 下线 / 重复实现
+    (re.compile(r"归位|拆|下线|收编|迁|复用|评估|逐字节相同|两份", re.I), "Refactor"),
+    # Chore：工程杂项 / 运维报告
+    (re.compile(r"\[(refactor|matrix|chore|deps|ci)\]|报告$|汇总$", re.I), "Chore"),
+    # Enhancement：能力缺口 / 增强
+    (re.compile(
+        r"建议|支持|提供|增强|缺|诉求|选项|变体|模式|门禁|防护|钩子|特性|扩展|校验|已就绪|选择器|可否|能否"
+        r"|无法|官方化|采纳|产品化",
+        re.I,
+    ), "Enhancement"),
 ]
 
 
-def infer_kind(title: str) -> str | None:
+def infer_kind(title: str) -> str:
     for pat, kind in TITLE_KIND_RULES:
         if pat.search(title):
             return kind
-    return None
+    return "Enhancement"
+
+
+def infer_module(repo, title: str) -> str | None:
+    """从 issue 所在仓推 Module；仓不在矩阵内时看标题前缀，再退回 meta。"""
+    name = ""
+    if isinstance(repo, dict):
+        name = repo.get("name") or (repo.get("nameWithOwner") or "").split("/")[-1]
+    elif isinstance(repo, str):
+        # 既可能是 oekit/pkg，也可能是 https://github.com/oekit/pkg
+        name = repo.rstrip("/").split("/")[-1]
+    if name:
+        return name
+    m = re.match(r"\[([^\]/]+)", title or "")
+    if m:
+        return m.group(1).strip()
+    return "meta"
 
 
 def list_org_issues() -> list[dict]:
@@ -257,70 +286,144 @@ def sync_issue_board(apply: bool) -> None:
     proj = load_project(PROJECT_ISSUE)
     status_opts = opt_map(proj["fields"].get("Status"))
     kind_opts = opt_map(proj["fields"].get("Kind"))
+    mod_opts = opt_map(proj["fields"].get("Module"))
     status_id = proj["fields"]["Status"]["id"]
     kind_id = proj["fields"].get("Kind", {}).get("id")
+    mod_id = proj["fields"].get("Module", {}).get("id")
 
     by_url = {i["url"]: i for i in proj["items"] if i["url"]}
     issues = list_org_issues()
     print(f"org issues={len(issues)} board={len(proj['items'])}")
 
     adds: list[dict] = []
-    syncs: list[tuple[str, str, str, str | None]] = []
+    syncs: list[dict] = []
     for iss in issues:
         # gh search 返回小写 open/closed，GraphQL 是大写 OPEN/CLOSED——统一不敏感比较
         want_status = "Todo" if iss["state"].upper() == "OPEN" else "Done"
         want_kind = infer_kind(iss["title"])
+        want_mod = infer_module(iss.get("repository", ""), iss["title"])
         if iss["url"] not in by_url:
-            adds.append({**iss, "want_status": want_status, "want_kind": want_kind})
+            adds.append(
+                {
+                    **iss,
+                    "want_status": want_status,
+                    "want_kind": want_kind,
+                    "want_mod": want_mod,
+                }
+            )
             continue
         item = by_url[iss["url"]]
         cur_status = item["fv"].get("Status")
         cur_kind = item["fv"].get("Kind")
-        if cur_status != want_status or (want_kind and not cur_kind):
-            syncs.append((item["id"], iss["title"], want_status, want_kind))
+        cur_mod = item["fv"].get("Module")
+        # Kind/Module 缺了就补；已有不覆盖（尊重人工修订）
+        if (
+            cur_status != want_status
+            or (want_kind and not cur_kind)
+            or (want_mod and not cur_mod)
+        ):
+            syncs.append(
+                {
+                    "id": item["id"],
+                    "title": iss["title"],
+                    "status": want_status,
+                    "kind": want_kind,
+                    "mod": want_mod,
+                    "cur_kind": cur_kind,
+                    "cur_mod": cur_mod,
+                }
+            )
 
     for a in adds:
-        print(f"  + {a['url']}  {a['want_status']}/{a['want_kind']}")
-    for _, title, st, kd in syncs:
-        print(f"  ~ {title[:48]}  → {st} {kd or ''}")
+        print(f"  + {a['url']}  {a['want_status']}/{a['want_kind']}/{a['want_mod']}")
+    for s in syncs:
+        bits = []
+        if s["status"]:
+            bits.append(s["status"])
+        if s["kind"] and not s["cur_kind"]:
+            bits.append(s["kind"])
+        if s["mod"] and not s["cur_mod"]:
+            bits.append(s["mod"])
+        print(f"  ~ {s['title'][:48]}  → {'/'.join(bits)}")
     if not apply:
         print("  (dry-run)")
         return
 
+    def assign(iid: str, status: str, kind: str | None, mod: str | None) -> None:
+        if status in status_opts:
+            set_field(proj["id"], iid, status_id, option_id=status_opts[status])
+        if kind and kind in kind_opts and kind_id:
+            set_field(proj["id"], iid, kind_id, option_id=kind_opts[kind])
+        if mod and mod in mod_opts and mod_id:
+            set_field(proj["id"], iid, mod_id, option_id=mod_opts[mod])
+        elif mod and mod_id:
+            # 模板里没有的模块名，落 meta，避免整列空着
+            if "meta" in mod_opts:
+                set_field(proj["id"], iid, mod_id, option_id=mod_opts["meta"])
+
     for a in adds:
         iid = add_url(proj["id"], a["url"])
-        if a["want_status"] in status_opts:
-            set_field(proj["id"], iid, status_id, option_id=status_opts[a["want_status"]])
-        if a["want_kind"] and a["want_kind"] in kind_opts and kind_id:
-            set_field(proj["id"], iid, kind_id, option_id=kind_opts[a["want_kind"]])
-    for iid, title, st, kd in syncs:
-        if st in status_opts:
-            set_field(proj["id"], iid, status_id, option_id=status_opts[st])
-        if kd and kd in kind_opts and kind_id:
-            item = next((x for x in proj["items"] if x["id"] == iid), None)
-            if item and not item["fv"].get("Kind"):
-                set_field(proj["id"], iid, kind_id, option_id=kind_opts[kd])
+        assign(iid, a["want_status"], a["want_kind"], a["want_mod"])
+    for s in syncs:
+        assign(s["id"], s["status"], s["kind"] if not s["cur_kind"] else None, s["mod"] if not s["cur_mod"] else None)
 
 
 # ---------------------------------------------------------------------------
 # PR 审查队列
 # ---------------------------------------------------------------------------
 
+# conventional commit 类型 → Scope（优先于正文关键词）
+CC_TYPE_RE = re.compile(
+    r"^(feat|fix|docs|style|refactor|perf|test|build|ci|chore|revert)(?:\(|:|!)",
+    re.I,
+)
+CC_TO_SCOPE = {
+    "feat": "feat",
+    "fix": "fix",
+    "docs": "docs",
+    "style": "chore",
+    "refactor": "refactor",
+    "perf": "feat",
+    "test": "chore",
+    "build": "deps",
+    "ci": "ci",
+    "chore": "chore",
+    "revert": "chore",
+}
+
 SCOPE_RULES: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"\bdocs?\b|\[docs?\]|文档|README|godoc|llms", re.I), "docs"),
     (re.compile(r"\bfix\b|\[fix\]|修复|bugfix", re.I), "fix"),
     (re.compile(r"\brefactor\b|重构|归位|拆", re.I), "refactor"),
-    (re.compile(r"\bchore\b|杂项|依赖|deps", re.I), "chore"),
     (re.compile(r"\bci\b|workflow|action|门禁", re.I), "ci"),
+    (re.compile(r"\bdeps\b|依赖|dependabot|bump ", re.I), "deps"),
+    (re.compile(r"\bchore\b|杂项", re.I), "chore"),
     (re.compile(r"\bfeat\b|特性|新增|支持|增强", re.I), "feat"),
 ]
 
 
-def infer_scope(title: str) -> str | None:
+def infer_scope(title: str) -> str:
+    """Scope：先认 conventional commit 类型，再落关键词，最后 feat。"""
+    m = CC_TYPE_RE.match(title or "")
+    if m:
+        t = m.group(1).lower()
+        if t == "chore" and re.search(r"\bdeps\b|dependabot|bump |依赖", title, re.I):
+            return "deps"
+        return CC_TO_SCOPE.get(t, "chore")
     for pat, scope in SCOPE_RULES:
         if pat.search(title):
             return scope
     return "feat"
+
+
+def infer_review(state: str) -> str:
+    """gh search prs state: open | merged | closed。"""
+    s = (state or "").upper()
+    if s == "OPEN":
+        return "待审"
+    if s == "MERGED":
+        return "已合入"
+    return "已关闭"
 
 
 def list_org_prs() -> list[dict]:
@@ -358,35 +461,49 @@ def sync_pr_board(apply: bool) -> None:
     print(f"org prs={len(prs)} board={len(proj['items'])}")
 
     adds: list[dict] = []
-    syncs: list[tuple[str, str, str, str | None]] = []
+    syncs: list[dict] = []
     for pr in prs:
-        # gh search prs 返回小写 open/merged/closed
-        want_review = "待审" if pr["state"].upper() == "OPEN" else "已合入"
+        want_review = infer_review(pr["state"])
         want_scope = infer_scope(pr["title"])
         if pr["url"] not in by_url:
             adds.append({**pr, "want_review": want_review, "want_scope": want_scope})
             continue
         item = by_url[pr["url"]]
-        if item["fv"].get("Review") != want_review:
-            syncs.append((item["id"], pr["title"], want_review, want_scope))
+        cur_review = item["fv"].get("Review")
+        cur_scope = item["fv"].get("Scope")
+        # Review 跟 state 走（权威）；Scope 只补空，不覆盖人工修订
+        if cur_review != want_review or (want_scope and not cur_scope):
+            syncs.append(
+                {
+                    "id": item["id"],
+                    "title": pr["title"],
+                    "review": want_review,
+                    "scope": want_scope if not cur_scope else None,
+                }
+            )
 
     for a in adds:
         print(f"  + {a['url']}  {a['want_review']}/{a['want_scope']}")
-    for _, title, review, scope in syncs:
-        print(f"  ~ {title[:48]}  → {review} {scope or ''}")
+    for s in syncs:
+        bits = [s["review"]]
+        if s["scope"]:
+            bits.append(s["scope"])
+        print(f"  ~ {s['title'][:48]}  → {'/'.join(bits)}")
     if not apply:
         print("  (dry-run)")
         return
 
-    for a in adds:
-        iid = add_url(proj["id"], a["url"])
-        if a["want_review"] in review_opts:
-            set_field(proj["id"], iid, review_id, option_id=review_opts[a["want_review"]])
-        if a["want_scope"] in scope_opts and scope_id:
-            set_field(proj["id"], iid, scope_id, option_id=scope_opts[a["want_scope"]])
-    for iid, _, review, _ in syncs:
+    def assign(iid: str, review: str, scope: str | None) -> None:
         if review in review_opts:
             set_field(proj["id"], iid, review_id, option_id=review_opts[review])
+        if scope and scope in scope_opts and scope_id:
+            set_field(proj["id"], iid, scope_id, option_id=scope_opts[scope])
+
+    for a in adds:
+        iid = add_url(proj["id"], a["url"])
+        assign(iid, a["want_review"], a["want_scope"])
+    for s in syncs:
+        assign(s["id"], s["review"], s["scope"])
 
 
 # ---------------------------------------------------------------------------
@@ -568,11 +685,15 @@ def sync_version_board(apply: bool) -> None:
 
 
 def sync_health_board(apply: bool) -> None:
+    """矩阵健康：Install/Tag 并排对照 + Note 诊断 + Hygiene/Drift 汇总。"""
     print("\n=== #3 矩阵健康 ===")
     proj = load_project(PROJECT_HEALTH)
     hy_opts = opt_map(proj["fields"].get("Hygiene"))
     hy_id = proj["fields"]["Hygiene"]["id"]
     drift_id = proj["fields"].get("Drift", {}).get("id")
+    install_id = proj["fields"].get("Install", {}).get("id")
+    tag_id = proj["fields"].get("Tag", {}).get("id")
+    note_id = proj["fields"].get("Note", {}).get("id")
 
     by_title = {it["title"]: it for it in proj["items"] if it["title"]}
     updates = 0
@@ -581,35 +702,50 @@ def sync_health_board(apply: bool) -> None:
         if not item:
             continue
         tags = latest_tags(mod)
-        latest = tags[0] if tags else None
-        install = remote_install_line(mod)
-        if latest is None and install is None:
+        latest = tags[0] if tags else ""
+        install = remote_install_line(mod) or ""
+        if not latest and not install:
             want, drift = "待审计", 0
-            note = "no tag/readme"
-        elif latest and install is None:
+            note = "无 tag / 无安装行"
+        elif latest and not install:
             want, drift = "待审计", 0
-            note = f"tag={latest} 无安装行"
+            note = f"tag={latest}，README 无 go get 安装行"
         elif latest and install and install != latest:
             want, drift = "有漂移", 1
-            note = f"安装行 {install} ≠ tag {latest}"
+            note = f"安装行 {install} ≠ 最新 tag {latest}"
         else:
             want, drift = "全绿", 0
-            note = f"安装行 {install} = tag {latest}"
+            note = f"安装行 = tag = {latest}"
 
         cur = item["fv"].get("Hygiene")
         cur_drift = item["fv"].get("Drift")
+        cur_install = item["fv"].get("Install") or ""
+        cur_tag = item["fv"].get("Tag") or ""
+        cur_note = item["fv"].get("Note") or ""
         try:
             cur_drift_n = float(cur_drift) if cur_drift is not None else None
         except (TypeError, ValueError):
             cur_drift_n = None
-        if cur != want or cur_drift_n != float(drift):
-            print(f"  ~ {mod}: {cur}/{cur_drift} → {want}/{drift}  ({note})")
+        if (
+            cur != want
+            or cur_drift_n != float(drift)
+            or cur_install != install
+            or cur_tag != latest
+            or cur_note != note
+        ):
+            print(f"  ~ {mod}: {cur}/{cur_drift} → {want}/{drift}  install={install or '-'} tag={latest or '-'}")
             updates += 1
             if apply:
                 if want in hy_opts:
                     set_field(proj["id"], item["id"], hy_id, option_id=hy_opts[want])
                 if drift_id is not None:
                     set_field(proj["id"], item["id"], drift_id, number=float(drift))
+                if install_id is not None:
+                    set_field(proj["id"], item["id"], install_id, text=install)
+                if tag_id is not None:
+                    set_field(proj["id"], item["id"], tag_id, text=latest)
+                if note_id is not None:
+                    set_field(proj["id"], item["id"], note_id, text=note)
     if not updates:
         print("  all up to date")
     if not apply and updates:
