@@ -45,7 +45,7 @@ PR 模板 ──► 各仓 PR ──► PR 审查队列 (待审→可合入)
 | `test-nested` | `true` | 自动发现嵌套 `go.mod` 子模块并 `build + test -race`（logx/sink 这类不再漏测） |
 | `additional-script` | `''` | 测试后的附加检查（多行 shell）；嵌套模块已由 `test-nested` 接管，只放特例 |
 | `govulncheck` | `true` | 漏洞扫描（pin v1.9.0）——**非阻塞报告**。扫描器自身要求 go≥1.26：pin≥1.26 的仓正常出报告，1.24/1.25 仓显示黄色注解但不阻塞；转阻塞门禁需先统一工具链（go 版本升级暂缓中）|
-| `tidy-check` | `true` | `go mod tidy -diff` 门禁，检测 go.mod/go.sum 漂移（指向已删 tag 的版本地板、旧 import 路径等）|
+| `tidy-check` | `true` | `go mod tidy -diff` 门禁（含嵌套子模块），检测 go.mod/go.sum 漂移（指向已删 tag 的版本地板、旧 import 路径等）|
 
 ### 模块仓库接入方式
 

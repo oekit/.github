@@ -77,7 +77,20 @@ jobs:
 
       - name: Check go mod tidy
         if: inputs.tidy-check
-        run: go mod tidy -diff
+        run: |
+          set -euo pipefail
+          go mod tidy -diff
+          # 嵌套子模块各自独立 go.mod，一并做 tidy 门禁
+          while IFS= read -r mod; do
+            dir=$(dirname "$mod")
+            [ "$dir" = "." ] && continue
+            case "$dir" in
+              ./vendor/*|./third_party/*|./testdata/*|./examples/*|./.git/*) continue ;;
+            esac
+            echo "::group::tidy ${dir#./}"
+            (cd "$dir" && go mod tidy -diff)
+            echo "::endgroup::"
+          done < <(find . -name go.mod -not -path './.git/*' | sort)
 
       - name: Check formatting
         run: |
