@@ -55,8 +55,9 @@ try:
         tag = r.stdout.strip()
 except FileNotFoundError:
     pass
-if tag and not tag.startswith("wormhole"):
-    if f"## [{tag}]" not in lines:
+if tag:
+    # 同名小节匹配用前缀（小节行带日期后缀，如 "## [v0.13.1] — 2026-10-18"）
+    if not any(l.startswith(f"## [{tag}]") for l in lines):
         errors.append(f"{path}: HEAD 处于 tag {tag}，但无同名小节 ## [{tag}]")
     if "Unreleased" in seen:
         u_lineno = seen["Unreleased"]
