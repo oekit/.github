@@ -30,12 +30,13 @@ PR 模板 ──► 各仓 PR ──► PR 审查队列 (待审→可合入)
 
 ## 大盘自动化同步
 
-GitHub Projects **不会**自动纳入 org 下新开的 issue/PR，也不会跟进 tag。本仓提供定时同步：
+GitHub Projects **不会**自动纳入 issue/PR，也不会跟进 tag。本仓提供**事件驱动 + 定时兜底**：
 
-| 通道 | 做什么 |
-|---|---|
-| `scripts/sync-projects.py` | 统一同步四块大盘（可 `--only 1..4` 单跑、默认 dry-run、`--apply` 写入） |
-| `.github/workflows/issue-project-sync.yml` | 每 2 小时 + 手动触发，跑 `sync-projects.py --apply` |
+| 通道 | 触发 | 做什么 |
+|---|---|---|
+| 各仓 `issue-to-project.yml` | issue/PR 开关、tag 推送、main 提交 | **秒级**入板/刷新（`--link` / `--refresh-module`） |
+| `issue-project-sync.yml` | 每小时 + 手动 | 全量对齐四块大盘（`--apply`） |
+| `scripts/sync-project-hooks.sh` | 手动 | 给各模块仓装 hook + secret |
 
 同步规则：
 
