@@ -864,8 +864,12 @@ def refresh_module(mod: str) -> None:
     """事件驱动的单模块刷新：版本矩阵（含嵌套）+ 矩阵健康。
 
     tag 推送 / README 安装行变更后调用，不等全量轮询。
+    不在 MODULES 里的仓（.github / matrix-tools 等治理仓）只吃 issue/PR 入板，不建版本行。
     """
     print(f"\n=== refresh {mod} ===")
+    if mod not in MODULES:
+        print(f"  skip (不在矩阵 MODULES): {mod}")
+        return
     root = latest_tags(mod)
     nested = nested_tags(mod)
     install = remote_install_line(mod) or ""
