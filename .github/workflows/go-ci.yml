@@ -101,6 +101,21 @@ jobs:
             exit 1
           fi
 
+      # 规则本体在本仓 scripts/changelog_check.py（单一事实源；改动即全 org 生效）
+      - name: Check out org shared scripts
+        uses: actions/checkout@v7
+        with:
+          repository: oekit/.github
+          ref: main
+          path: org-ci
+          persist-credentials: false
+
+      - name: Check CHANGELOG/tag consistency
+        # .github#6：主模块版本节严格递减无重复、[Unreleased] 只允许最顶部一个、
+        # tag 检出时必须有同名小节且 [Unreleased] 无正文——消费方做 0.x minor
+        # breaking 评估只能靠 CHANGELOG，一致性即对外契约
+        run: python3 org-ci/scripts/changelog_check.py
+
       - name: golangci-lint
         uses: golangci/golangci-lint-action@v9
         with:

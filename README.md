@@ -193,3 +193,11 @@ templates/dependabot-gomod.yml           # 模块仓 dependabot 模板
 | `bootstrap` | 嵌套 nacos/obs 由 `test-nested` 自动测试；根模块走默认覆盖率门禁 30 |
 | `logx` | 嵌套 hlog/hertzlog/kitexlog/sink 由 `test-nested` 自动测试；dependabot 需为每个嵌套模块各一条 `directory` |
 | `kitex-examples` | `test-script: go build ./...` + 关闭覆盖率门禁（示例仓无测试） |
+
+## 发布纪律（.github#5）
+
+- **tag 不可变**：同名 tag 严禁重推（proxy/sumdb 缓存会让全体已缓存消费方 `checksum mismatch` 集体中毒，错误信息完全指不到根因）；各矩阵仓已启用 `protect-release-tags` ruleset（v* tag 禁 update/删除/非快进，无人可 bypass）。
+- **版本号只能前进**：结构重置（历史清空）必须换新版本号段（哪怕大跳版），不得复用旧版本号——hertz v0.5.1 重置事故的直接教训。
+- **tag 推送即门禁**：各仓 ci.yml 已加 `tags: ['v*']` 触发，tag 推送时完整跑 tidy/build/test/CHANGELOG 一致性检查（发版后亮红 = 立即处置，而不是等消费方报 checksum mismatch）。
+- **嵌套模块同 train 发版**：用 matrix-tools `scripts/release_train.py`（ls-remote 查重/tidy/build/CHANGELOG 四道前置，全部通过才打 tag）。
+
