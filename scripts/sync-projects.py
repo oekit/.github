@@ -214,32 +214,51 @@ def opt_map(field: dict | None) -> dict[str, str]:
 # Issue 大盘
 # ---------------------------------------------------------------------------
 
-TITLE_KIND_RULES: list[tuple[re.Pattern[str], str]] = [
-    # Docs：显式 docs 前缀 / 指南 / 说明 / 文档类
-    (re.compile(r"\[(docs|migration|readme|godoc|llms|site|docs/|llms\.txt)\]|指南|说明|文档|README|CONTRIBUTING|AGENTS|注释", re.I), "Docs"),
-    # Bug：破坏不变量 / 泄露 / panic / 与文档矛盾 / 静默失败
+# (pattern, kind, weight) — 打分制，避免单关键词误伤（如「错误变体」被裸「误」判成 Bug）
+KIND_SIGNALS: list[tuple[re.Pattern[str], str, int]] = [
+    # ---- Bug（只收“已经坏了”的表述，不收“提议防 X”）----
+    (re.compile(r"fix\(|\[fix\]|\[bug\]", re.I), "Bug", 5),
     (re.compile(
-        r"fix\(|\[fix\]|\[bug\]|不存在|静默|崩溃|越权|丢失|不一致|炸|泄露|泄漏|泄进|破坏|矛盾|陷阱|panic|绕过|折叠|误"
-        r"|残留|过期|不去重|撞车|无人引用|重复执行|仍是|仍写",
+        r"不存在|静默|崩溃|越权|泄露|泄漏|泄进|矛盾|陷阱|绕过|折叠"
+        r"|撞车|被重打|双.*编码|签名错误|全体折叠|直连可绕过|仍写|仍是"
+        r"|全部 panic|均 panic|全 panic",
         re.I,
-    ), "Bug"),
-    # Refactor：归位 / 拆 / 迁 / 下线 / 重复实现
-    (re.compile(r"归位|拆|下线|收编|迁|复用|评估|逐字节相同|两份", re.I), "Refactor"),
-    # Chore：工程杂项 / 运维报告
-    (re.compile(r"\[(refactor|matrix|chore|deps|ci)\]|报告$|汇总$", re.I), "Chore"),
-    # Enhancement：能力缺口 / 增强
+    ), "Bug", 4),
+    (re.compile(r"误标|误导|误判|误用|误报|错误输出|错误文本|渲染为 \{\}", re.I), "Bug", 3),
+    (re.compile(r"残留|过期|不去重|重复执行|破坏不变量|只读约定未声明", re.I), "Bug", 2),
+    # ---- Enhancement ----
     (re.compile(
-        r"建议|支持|提供|增强|缺|诉求|选项|变体|模式|门禁|防护|钩子|特性|扩展|校验|已就绪|选择器|可否|能否"
-        r"|无法|官方化|采纳|产品化",
+        r"建议|支持|提供|增强|诉求|选项|变体|模式|门禁|防护|钩子|特性|扩展"
+        r"|已就绪|选择器|可否|能否|无法|官方化|采纳|产品化|评估|复用|三态|探测"
+        r"|缺[一-鿿]|缺[A-Z]|^缺|——缺|缺「|缺声明|缺返回|缺单边|缺联动|缺链接|缺能力",
         re.I,
-    ), "Enhancement"),
+    ), "Enhancement", 3),
+    (re.compile(r"\[feature\]|\[feat\]|\[缺能力\]|增加.*校验|增加.*门禁|增加.*检查", re.I), "Enhancement", 3),
+    # ---- Refactor ----
+    (re.compile(r"归位|拆出|拆子包|拆嵌套|下线|收编|迁至|迁到|去 hertz 化|逐字节相同|两份|无人引用", re.I), "Refactor", 3),
+    # ---- Docs ----
+    (re.compile(
+        r"\[(docs|migration|readme|godoc|llms|site|llms\.txt)([/\]])"
+        r"|指南|文档化|未文档化|文档站|文档缺|README|CONTRIBUTING|AGENTS|llms\.txt",
+        re.I,
+    ), "Docs", 4),
+    (re.compile(r"注释把|注释错误|注释写|godoc|文档示例|包文档", re.I), "Docs", 2),
+    # ---- Chore ----
+    (re.compile(r"\[(chore|deps|ci)\]|报告$|汇总$|矩阵漂移报告", re.I), "Chore", 3),
 ]
 
 
 def infer_kind(title: str) -> str:
-    for pat, kind in TITLE_KIND_RULES:
-        if pat.search(title):
-            return kind
+    """按信号打分归类；同分按 Bug > Enhancement > Refactor > Docs > Chore。"""
+    scores = {"Bug": 0, "Enhancement": 0, "Refactor": 0, "Docs": 0, "Chore": 0}
+    for pat, kind, weight in KIND_SIGNALS:
+        if pat.search(title or ""):
+            scores[kind] += weight
+    if max(scores.values()) <= 0:
+        return "Enhancement"
+    for k in ("Bug", "Enhancement", "Refactor", "Docs", "Chore"):
+        if scores[k] == max(scores.values()):
+            return k
     return "Enhancement"
 
 
@@ -268,7 +287,8 @@ def list_org_issues() -> list[dict]:
                 "gh", "search", "issues",
                 "--owner", ORG,
                 "--state", state,
-                "--limit", "100",
+                # 必须留足余量：org issue 超过后 search 静默截断，板上会缺行
+                "--limit", "200",
                 "--json", "repository,title,number,url,state",
             ],
             text=True,
@@ -316,11 +336,11 @@ def sync_issue_board(apply: bool) -> None:
         cur_status = item["fv"].get("Status")
         cur_kind = item["fv"].get("Kind")
         cur_mod = item["fv"].get("Module")
-        # Kind/Module 缺了就补；已有不覆盖（尊重人工修订）
+        # Kind/Module 是推导列，跟规则走；Status 跟 state 走
         if (
             cur_status != want_status
-            or (want_kind and not cur_kind)
-            or (want_mod and not cur_mod)
+            or (want_kind and cur_kind != want_kind)
+            or (want_mod and cur_mod != want_mod)
         ):
             syncs.append(
                 {
@@ -340,10 +360,10 @@ def sync_issue_board(apply: bool) -> None:
         bits = []
         if s["status"]:
             bits.append(s["status"])
-        if s["kind"] and not s["cur_kind"]:
-            bits.append(s["kind"])
-        if s["mod"] and not s["cur_mod"]:
-            bits.append(s["mod"])
+        if s["kind"] and s["kind"] != s["cur_kind"]:
+            bits.append(f"kind:{s['cur_kind']}→{s['kind']}")
+        if s["mod"] and s["mod"] != s["cur_mod"]:
+            bits.append(f"mod:{s['cur_mod']}→{s['mod']}")
         print(f"  ~ {s['title'][:48]}  → {'/'.join(bits)}")
     if not apply:
         print("  (dry-run)")
@@ -365,7 +385,7 @@ def sync_issue_board(apply: bool) -> None:
         iid = add_url(proj["id"], a["url"])
         assign(iid, a["want_status"], a["want_kind"], a["want_mod"])
     for s in syncs:
-        assign(s["id"], s["status"], s["kind"] if not s["cur_kind"] else None, s["mod"] if not s["cur_mod"] else None)
+        assign(s["id"], s["status"], s["kind"], s["mod"])
 
 
 # ---------------------------------------------------------------------------
@@ -435,7 +455,8 @@ def list_org_prs() -> list[dict]:
                 "gh", "search", "prs",
                 "--owner", ORG,
                 "--state", state,
-                "--limit", "50",
+                # 曾用 50 导致 closed PR 被截断（实际 65+），15 条进不了板
+                "--limit", "200",
                 "--json", "repository,title,number,url,state",
             ],
             text=True,
@@ -471,14 +492,15 @@ def sync_pr_board(apply: bool) -> None:
         item = by_url[pr["url"]]
         cur_review = item["fv"].get("Review")
         cur_scope = item["fv"].get("Scope")
-        # Review 跟 state 走（权威）；Scope 只补空，不覆盖人工修订
-        if cur_review != want_review or (want_scope and not cur_scope):
+        # Review 跟 state 走；Scope 跟标题 CC 类型走（都是推导列）
+        if cur_review != want_review or (want_scope and cur_scope != want_scope):
             syncs.append(
                 {
                     "id": item["id"],
                     "title": pr["title"],
                     "review": want_review,
-                    "scope": want_scope if not cur_scope else None,
+                    "scope": want_scope,
+                    "cur_scope": cur_scope,
                 }
             )
 
@@ -486,8 +508,8 @@ def sync_pr_board(apply: bool) -> None:
         print(f"  + {a['url']}  {a['want_review']}/{a['want_scope']}")
     for s in syncs:
         bits = [s["review"]]
-        if s["scope"]:
-            bits.append(s["scope"])
+        if s.get("scope") and s["scope"] != s.get("cur_scope"):
+            bits.append(f"scope:{s.get('cur_scope')}→{s['scope']}")
         print(f"  ~ {s['title'][:48]}  → {'/'.join(bits)}")
     if not apply:
         print("  (dry-run)")
