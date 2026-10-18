@@ -74,53 +74,65 @@ def parse_github_url(url: str) -> tuple[str, int, str]:
 
 
 def load_project(number: int) -> dict:
-    data = gql(
-        """
-        query($org: String!, $number: Int!) {
-          organization(login: $org) {
-            projectV2(number: $number) {
-              id
-              fields(first: 30) {
-                nodes {
-                  ... on ProjectV2Field { id name }
-                  ... on ProjectV2SingleSelectField {
-                    id name
-                    options { id name }
-                  }
-                }
-              }
-              items(first: 100) {
-                nodes {
+    """拉全项目字段与条目（items 游标分页，避免 first:100 静默截断）。"""
+    fields: dict[str, dict] = {}
+    items: list[dict] = []
+    pid = None
+    cursor: str | None = None
+    while True:
+        vars_ = {"org": ORG, "number": str(number)}
+        if cursor:
+            vars_["cursor"] = cursor
+        data = gql(
+            """
+            query($org: String!, $number: Int!, $cursor: String) {
+              organization(login: $org) {
+                projectV2(number: $number) {
                   id
-                  type
-                  content {
-                    ... on Issue { number url state title
-                                   repository { nameWithOwner } }
-                    ... on PullRequest { number url state title
-                                         repository { nameWithOwner } }
-                    ... on DraftIssue { title body }
-                  }
-                  fieldValues(first: 20) {
+                  fields(first: 50) {
                     nodes {
-                      ... on ProjectV2ItemFieldSingleSelectValue {
-                        name
-                        field {
-                          ... on ProjectV2Field { id name }
-                          ... on ProjectV2SingleSelectField { id name }
-                        }
+                      ... on ProjectV2Field { id name }
+                      ... on ProjectV2SingleSelectField {
+                        id name
+                        options { id name }
                       }
-                      ... on ProjectV2ItemFieldTextValue {
-                        text
-                        field {
-                          ... on ProjectV2Field { id name }
-                          ... on ProjectV2SingleSelectField { id name }
-                        }
+                    }
+                  }
+                  items(first: 100, after: $cursor) {
+                    pageInfo { hasNextPage endCursor }
+                    nodes {
+                      id
+                      type
+                      content {
+                        ... on Issue { number url state title
+                                       repository { nameWithOwner } }
+                        ... on PullRequest { number url state title
+                                             repository { nameWithOwner } }
+                        ... on DraftIssue { title body }
                       }
-                      ... on ProjectV2ItemFieldNumberValue {
-                        number
-                        field {
-                          ... on ProjectV2Field { id name }
-                          ... on ProjectV2SingleSelectField { id name }
+                      fieldValues(first: 50) {
+                        nodes {
+                          ... on ProjectV2ItemFieldSingleSelectValue {
+                            name
+                            field {
+                              ... on ProjectV2Field { id name }
+                              ... on ProjectV2SingleSelectField { id name }
+                            }
+                          }
+                          ... on ProjectV2ItemFieldTextValue {
+                            text
+                            field {
+                              ... on ProjectV2Field { id name }
+                              ... on ProjectV2SingleSelectField { id name }
+                            }
+                          }
+                          ... on ProjectV2ItemFieldNumberValue {
+                            number
+                            field {
+                              ... on ProjectV2Field { id name }
+                              ... on ProjectV2SingleSelectField { id name }
+                            }
+                          }
                         }
                       }
                     }
@@ -128,40 +140,44 @@ def load_project(number: int) -> dict:
                 }
               }
             }
-          }
-        }
-        """,
-        org=ORG,
-        number=str(number),
-    )
-    proj = data["organization"]["projectV2"]
-    fields = {f["name"]: f for f in proj["fields"]["nodes"]}
-    items = []
-    for n in proj["items"]["nodes"]:
-        content = n.get("content") or {}
-        fv = {}
-        for x in n.get("fieldValues", {}).get("nodes", []):
-            fname = (x.get("field") or {}).get("name")
-            if not fname:
-                continue
-            if "text" in x and x.get("text") is not None:
-                fv[fname] = x.get("text")
-            elif "number" in x and x.get("number") is not None:
-                fv[fname] = x.get("number")
-            else:
-                fv[fname] = x.get("name")
-        items.append(
-            {
-                "id": n["id"],
-                "url": content.get("url"),
-                "title": content.get("title"),
-                "state": content.get("state"),
-                "repo": (content.get("repository") or {}).get("nameWithOwner"),
-                "number": content.get("number"),
-                "fv": fv,
-            }
+            """,
+            **vars_,
         )
-    return {"id": proj["id"], "fields": fields, "items": items}
+        proj = data["organization"]["projectV2"]
+        pid = proj["id"]
+        for f in proj["fields"]["nodes"]:
+            fields[f["name"]] = f
+        for n in proj["items"]["nodes"]:
+            content = n.get("content") or {}
+            fv = {}
+            for x in n.get("fieldValues", {}).get("nodes", []):
+                fname = (x.get("field") or {}).get("name")
+                if not fname:
+                    continue
+                if "text" in x and x.get("text") is not None:
+                    fv[fname] = x.get("text")
+                elif "number" in x and x.get("number") is not None:
+                    fv[fname] = x.get("number")
+                else:
+                    fv[fname] = x.get("name")
+            items.append(
+                {
+                    "id": n["id"],
+                    "url": content.get("url"),
+                    "title": content.get("title"),
+                    "state": content.get("state"),
+                    "repo": (content.get("repository") or {}).get("nameWithOwner"),
+                    "number": content.get("number"),
+                    "fv": fv,
+                }
+            )
+        page = proj["items"]["pageInfo"]
+        if not page.get("hasNextPage"):
+            break
+        cursor = page.get("endCursor")
+        if not cursor:
+            break
+    return {"id": pid, "fields": fields, "items": items}
 
 
 def set_field(pid: str, item_id: str, field_id: str, *, option_id: str | None = None, text: str | None = None, number: float | None = None) -> None:
@@ -293,7 +309,10 @@ def list_org_issues() -> list[dict]:
             ],
             text=True,
         )
-        for i in json.loads(raw):
+        batch = json.loads(raw)
+        if len(batch) >= 200:
+            print(f"  ! search issues state={state} hit limit 200，可能被截断", file=sys.stderr)
+        for i in batch:
             if i["url"] in seen or "/pull/" in i["url"]:
                 continue
             seen.add(i["url"])
@@ -461,7 +480,10 @@ def list_org_prs() -> list[dict]:
             ],
             text=True,
         )
-        for i in json.loads(raw):
+        batch = json.loads(raw)
+        if len(batch) >= 200:
+            print(f"  ! search prs state={state} hit limit 200，可能被截断", file=sys.stderr)
+        for i in batch:
             if i["url"] in seen:
                 continue
             seen.add(i["url"])
@@ -722,7 +744,13 @@ def sync_health_board(apply: bool) -> None:
     for mod in MODULES:
         item = by_title.get(mod)
         if not item:
-            continue
+            print(f"  + create row {mod}")
+            updates += 1
+            if not apply:
+                continue
+            iid = add_draft(proj["id"], mod, f"{mod} 矩阵健康")
+            item = {"id": iid, "fv": {}}
+            by_title[mod] = item
         tags = latest_tags(mod)
         latest = tags[0] if tags else ""
         install = remote_install_line(mod) or ""
@@ -775,13 +803,76 @@ def sync_health_board(apply: bool) -> None:
 
 
 # ---------------------------------------------------------------------------
+# 即时入板（issue/PR 事件触发，单条快速路径）
+# ---------------------------------------------------------------------------
+
+
+def link_item(url: str, state: str) -> None:
+    """把一条 issue/PR 立刻挂进对应大盘并写字段。state: open|closed|merged。"""
+    repo, num, kind = parse_github_url(url)  # kind: issues|pulls
+    if kind == "pulls":
+        proj_num = PROJECT_PR
+        want_review = infer_review(state)
+    else:
+        proj_num = PROJECT_ISSUE
+        want_status = "Todo" if state.upper() == "OPEN" else "Done"
+
+    # 取 title 便于 Kind/Scope
+    meta = gh_json(["api", f"repos/{repo}/{kind}/{num}"])
+    title = (meta or {}).get("title") or ""
+
+    proj = load_project(proj_num)
+    by_url = {i["url"]: i for i in proj["items"] if i["url"]}
+    item = by_url.get(url)
+    if not item:
+        print(f"  + add {url}")
+        iid = add_url(proj["id"], url)
+    else:
+        iid = item["id"]
+        print(f"  = already on board {url}")
+
+    if kind == "issues":
+        status_opts = opt_map(proj["fields"].get("Status"))
+        kind_opts = opt_map(proj["fields"].get("Kind"))
+        mod_opts = opt_map(proj["fields"].get("Module"))
+        want_kind = infer_kind(title)
+        want_mod = infer_module(repo, title)
+        if want_status in status_opts:
+            set_field(proj["id"], iid, proj["fields"]["Status"]["id"], option_id=status_opts[want_status])
+        if want_kind in kind_opts:
+            set_field(proj["id"], iid, proj["fields"]["Kind"]["id"], option_id=kind_opts[want_kind])
+        if want_mod in mod_opts:
+            set_field(proj["id"], iid, proj["fields"]["Module"]["id"], option_id=mod_opts[want_mod])
+        elif "meta" in mod_opts:
+            set_field(proj["id"], iid, proj["fields"]["Module"]["id"], option_id=mod_opts["meta"])
+        print(f"  ✓ issue  status={want_status} kind={want_kind} mod={want_mod}  {title[:50]}")
+    else:
+        review_opts = opt_map(proj["fields"].get("Review"))
+        scope_opts = opt_map(proj["fields"].get("Scope"))
+        want_review = infer_review(state)
+        want_scope = infer_scope(title)
+        if want_review in review_opts:
+            set_field(proj["id"], iid, proj["fields"]["Review"]["id"], option_id=review_opts[want_review])
+        if want_scope in scope_opts:
+            set_field(proj["id"], iid, proj["fields"]["Scope"]["id"], option_id=scope_opts[want_scope])
+        print(f"  ✓ pr     review={want_review} scope={want_scope}  {title[:50]}")
+
+
+# ---------------------------------------------------------------------------
 
 
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--apply", action="store_true")
     ap.add_argument("--only", type=int, choices=[1, 2, 3, 4], help="只跑某块大盘")
+    ap.add_argument("--link", metavar="URL", help="即时把单条 issue/PR 挂进大盘")
+    ap.add_argument("--state", default="open", help="--link 配套状态：open|closed|merged")
     args = ap.parse_args()
+
+    if args.link:
+        link_item(args.link, args.state)
+        print("\nOK")
+        return 0
 
     only = args.only
     if only in (None, 1):

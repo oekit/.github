@@ -2,17 +2,26 @@ name: 大盘同步
 
 # org issue / PR / tag ↔ 四块 GitHub Projects 大盘自动对齐。
 # Projects v2 不会自动纳入跨仓 issue/PR，也不会跟进 tag——定时补齐。
+# 事件触发只覆盖本仓（oekit/.github），跨仓靠下面的轮询。
 
 on:
   schedule:
-    # 每 2 小时一次（避开整点）
-    - cron: '17 */2 * * *'
+    # 每小时一次（避开整点，降压）
+    - cron: '17 * * * *'
   workflow_dispatch:
+  issues:
+    types: [opened, closed, reopened]
+  pull_request:
+    types: [opened, closed, reopened]
 
 permissions:
   contents: read
   issues: read
   pull-requests: read
+
+concurrency:
+  group: issue-project-sync
+  cancel-in-progress: true
 
 jobs:
   sync:
