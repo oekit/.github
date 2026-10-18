@@ -11,8 +11,8 @@ Go 后端模块矩阵：**21 个独立发版的仓库**，从零依赖微工具�
   </picture>
 </p>
 
-- 🌐 官方站点：**https://oekit.github.io/**（含 8 篇指南）
-- 📦 模块矩阵：[pkg](https://github.com/oekit/pkg)（21 合 1 微工具集）· [logx](https://github.com/oekit/logx) · [tracing](https://github.com/oekit/tracing) · [registry](https://github.com/oekit/registry) · [middleware](https://github.com/oekit/middleware) · [hertz](https://github.com/oekit/hertz) · [kitex](https://github.com/oekit/kitex) · [bootstrap](https://github.com/oekit/bootstrap) · …
+- 🌐 官方站点：**https://oekit.github.io/**（含 9 篇指南）
+- 📦 模块矩阵：[pkg](https://github.com/oekit/pkg)（20 合 1 微工具集）· [kitx](https://github.com/oekit/kitx) · [logx](https://github.com/oekit/logx) · [tracing](https://github.com/oekit/tracing) · [registry](https://github.com/oekit/registry) · [middleware](https://github.com/oekit/middleware) · [hertz](https://github.com/oekit/hertz) · [kitex](https://github.com/oekit/kitex) · [bootstrap](https://github.com/oekit/bootstrap) · [etcdx](https://github.com/oekit/etcdx) · [k8s](https://github.com/oekit/k8s) · …
 - 🏗️ 架构总览：[oekit/oekit](https://github.com/oekit/oekit#架构总览)（上图源文件 + 分层表 + 关键依赖链）
 - 🤖 AI Agent：每仓 `AGENTS.md` + 全站 [llms.txt](https://oekit.github.io/llms.txt) + [《AI Agent 使用》](https://oekit.github.io/guide/ai-agent.html)
 - 📜 沿革：源自 ekit 单体库（git.enjoye.top/enjoydream/ekit v0.34.0，冻结维护），2026-10 按框架耦合分层拆分
