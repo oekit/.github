@@ -11,6 +11,8 @@ Projects v2 不会自动跟进 org 的 issue/PR/tag，本脚本补齐：
 用法：
   python3 scripts/sync-projects.py --apply           # 全量
   python3 scripts/sync-projects.py --apply --only 1  # 只跑 Issue 大盘
+  python3 scripts/sync-projects.py --link URL --state open   # 单条即时入板
+  python3 scripts/sync-projects.py --refresh-module logx     # 单模块版本+健康刷新
   python3 scripts/sync-projects.py                   # dry-run
 
 环境：
@@ -858,6 +860,104 @@ def link_item(url: str, state: str) -> None:
         print(f"  ✓ pr     review={want_review} scope={want_scope}  {title[:50]}")
 
 
+def refresh_module(mod: str) -> None:
+    """事件驱动的单模块刷新：版本矩阵（含嵌套）+ 矩阵健康。
+
+    tag 推送 / README 安装行变更后调用，不等全量轮询。
+    """
+    print(f"\n=== refresh {mod} ===")
+    root = latest_tags(mod)
+    nested = nested_tags(mod)
+    install = remote_install_line(mod) or ""
+
+    # ---- 版本大盘 ----
+    proj = load_project(PROJECT_VERSION)
+    latest_id = proj["fields"]["Latest"]["id"]
+    prior_id = proj["fields"]["Prior"]["id"]
+    parent_id = proj["fields"].get("Parent", {}).get("id")
+    layer_id = proj["fields"].get("Layer", {}).get("id")
+    layer_opts = opt_map(proj["fields"].get("Layer"))
+    by_title = {
+        (it["title"] or "").split("@")[0].strip(): it
+        for it in proj["items"]
+        if it["title"]
+    }
+
+    def upsert_version(title: str, latest: str, prior: str, parent: str, layer: str | None) -> None:
+        item = by_title.get(title)
+        if not item:
+            print(f"  + version {title}  {latest}/{prior or '-'}")
+            iid = add_draft(proj["id"], title, f"{parent} 嵌套模块" if parent else title)
+            by_title[title] = {"id": iid, "fv": {}}
+            item = by_title[title]
+            if parent and parent_id:
+                set_field(proj["id"], iid, parent_id, text=parent)
+            if layer and layer_id and layer in layer_opts:
+                set_field(proj["id"], iid, layer_id, option_id=layer_opts[layer])
+            if latest:
+                set_field(proj["id"], iid, latest_id, text=latest)
+            if prior:
+                set_field(proj["id"], iid, prior_id, text=prior)
+            return
+        cur_l = item["fv"].get("Latest")
+        cur_p = item["fv"].get("Prior")
+        if cur_l == latest and (not prior or cur_p == prior):
+            return
+        print(f"  ~ version {title}: {cur_l}/{cur_p} → {latest}/{prior or '-'}")
+        if latest:
+            set_field(proj["id"], item["id"], latest_id, text=latest)
+        if prior:
+            set_field(proj["id"], item["id"], prior_id, text=prior)
+
+    if root:
+        latest, prior = root[0], root[1] if len(root) > 1 else ""
+        upsert_version(mod, latest, prior, parent="", layer=LAYER_BY_MODULE.get(mod))
+        parent_layer = (by_title.get(mod) or {}).get("fv", {}).get("Layer")
+        for path, vers in sorted(nested.items()):
+            upsert_version(
+                f"{mod}/{path}",
+                vers[0] if vers else "",
+                vers[1] if len(vers) > 1 else "",
+                parent=mod,
+                layer=parent_layer,
+            )
+
+    # ---- 矩阵健康 ----
+    hproj = load_project(PROJECT_HEALTH)
+    hy_opts = opt_map(hproj["fields"].get("Hygiene"))
+    hy_id = hproj["fields"]["Hygiene"]["id"]
+    drift_id = hproj["fields"].get("Drift", {}).get("id")
+    install_id = hproj["fields"].get("Install", {}).get("id")
+    tag_id = hproj["fields"].get("Tag", {}).get("id")
+    note_id = hproj["fields"].get("Note", {}).get("id")
+    hitem = next((it for it in hproj["items"] if it["title"] == mod), None)
+    if not hitem:
+        print(f"  + health row {mod}")
+        hitem = {"id": add_draft(hproj["id"], mod, f"{mod} 矩阵健康"), "fv": {}}
+
+    latest = root[0] if root else ""
+    if not latest and not install:
+        want, drift, note = "待审计", 0, "无 tag / 无安装行"
+    elif latest and not install:
+        want, drift, note = "待审计", 0, f"tag={latest}，README 无 go get 安装行"
+    elif latest and install and install != latest:
+        want, drift, note = "有漂移", 1, f"安装行 {install} ≠ 最新 tag {latest}"
+    else:
+        want, drift, note = "全绿", 0, f"安装行 = tag = {latest}"
+
+    if want in hy_opts:
+        set_field(hproj["id"], hitem["id"], hy_id, option_id=hy_opts[want])
+    if drift_id is not None:
+        set_field(hproj["id"], hitem["id"], drift_id, number=float(drift))
+    if install_id is not None:
+        set_field(hproj["id"], hitem["id"], install_id, text=install)
+    if tag_id is not None:
+        set_field(hproj["id"], hitem["id"], tag_id, text=latest)
+    if note_id is not None:
+        set_field(hproj["id"], hitem["id"], note_id, text=note)
+    print(f"  ✓ health  {want}  install={install or '-'} tag={latest or '-'}")
+
+
 # ---------------------------------------------------------------------------
 
 
@@ -867,10 +967,20 @@ def main() -> int:
     ap.add_argument("--only", type=int, choices=[1, 2, 3, 4], help="只跑某块大盘")
     ap.add_argument("--link", metavar="URL", help="即时把单条 issue/PR 挂进大盘")
     ap.add_argument("--state", default="open", help="--link 配套状态：open|closed|merged")
+    ap.add_argument(
+        "--refresh-module",
+        metavar="NAME",
+        help="事件驱动：刷新单模块的版本矩阵 + 矩阵健康（tag/README 变更后）",
+    )
     args = ap.parse_args()
 
     if args.link:
         link_item(args.link, args.state)
+        print("\nOK")
+        return 0
+
+    if args.refresh_module:
+        refresh_module(args.refresh_module)
         print("\nOK")
         return 0
 
