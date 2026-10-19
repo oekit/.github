@@ -1,0 +1,141 @@
+name: Python CI (shared)
+
+# oekit org 统一 Python 仓 CI 门禁（reusable workflow）。
+# 与 go-ci.yml 对称：各仓库 .github/workflows/ci.yml 只保留一个薄调用层，
+# 规则统一在本仓维护：
+#   jobs:
+#     lint:
+#       uses: oekit/.github/.github/workflows/python-ci.yml@main
+#       with:
+#         python-version: '3.12'
+# 规则变更只改本文件，所有引用 @main 的仓库立即生效（激进变更请改用 tag 引用）。
+#
+# 为什么有这一层：Python 仓的脚本是「规则实现」而非「被调用的库」——矩阵审计、
+# 文档生成、发布编排全在 Python 里。脚本坏掉的形态很安静（语法错、import 链断、
+# YAML 写错），不会自己冒出来，必须有一道便宜的机械门禁兜住。
+#
+# 这里刻意**不做**的事：不执行脚本本体。矩阵仓的脚本里有一部分会在
+# `--help` 缺失时直接跑真实动作（发版、开 PR、写文件），盲跑冒烟会真的
+# 触发副作用——py_compile 与 YAML 解析这类纯静态检查才是安全且足够的。
+
+on:
+  workflow_call:
+    inputs:
+      python-version:
+        description: 'Python 版本（setup-python 语义，如 3.12 解析为最新 3.12.x）'
+        required: false
+        type: string
+        default: '3.12'
+      scripts-dir:
+        description: '存放脚本的目录（相对仓库根）'
+        required: false
+        type: string
+        default: 'scripts'
+  workflow_dispatch:
+    inputs:
+      python-version:
+        description: 'Python 版本'
+        required: false
+        type: string
+        default: '3.12'
+      scripts-dir:
+        description: '存放脚本的目录（相对仓库根）'
+        required: false
+        type: string
+        default: 'scripts'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: python-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  python-syntax:
+    name: Python syntax
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ inputs.python-version }}
+      - name: Python syntax
+        run: |
+          set -euo pipefail
+          fail=0
+          while IFS= read -r f; do
+            echo "::group::py_compile ${f}"
+            if ! python3 -m py_compile "$f"; then
+              fail=1
+            fi
+            echo "::endgroup::"
+          done < <(find "${{ inputs.scripts-dir }}" -name '*.py' | sort)
+          exit "$fail"
+
+  shell-syntax:
+    name: Shell syntax
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+      - name: Shell syntax
+        run: |
+          set -euo pipefail
+          fail=0
+          while IFS= read -r f; do
+            echo "::group::bash -n ${f}"
+            if ! bash -n "$f"; then
+              fail=1
+            fi
+            echo "::endgroup::"
+          done < <(find "${{ inputs.scripts-dir }}" -name '*.sh' | sort)
+          exit "$fail"
+
+  yaml:
+    name: YAML
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+      - name: YAML parse (workflows + templates + dependabot)
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import sys
+          from pathlib import Path
+
+          try:
+              import yaml
+          except ImportError:
+              import subprocess
+              subprocess.check_call([sys.executable, '-m', 'pip', 'install', '-q', 'pyyaml'])
+              import yaml
+
+          roots = [
+              Path('.github/workflows'),
+              Path('.github'),
+              Path('workflow-templates'),
+          ]
+          patterns = ('*.yml', '*.yaml')
+          files = []
+          for r in roots:
+              if not r.exists():
+                  continue
+              for p in patterns:
+                  files.extend(r.rglob(p))
+          files = sorted(set(files))
+          if not files:
+              print('no yaml files found')
+              sys.exit(1)
+          failed = 0
+          for f in files:
+              try:
+                  list(yaml.safe_load_all(f.read_text(encoding='utf-8')))
+                  print(f'OK   {f}')
+              except Exception as e:
+                  print(f'FAIL {f}: {e}')
+                  failed = 1
+          sys.exit(failed)
+          PY
