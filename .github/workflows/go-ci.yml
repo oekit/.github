@@ -81,14 +81,18 @@ jobs:
           set -euo pipefail
           go mod tidy -diff
           # 嵌套子模块各自独立 go.mod，一并做 tidy 门禁
+          # 每个子模块用它**自己 go.mod 声明的 go 指令**对应的工具链跑——
+          # 否则父仓的 go-version 会替子模块做决定，子模块声明的最低版本从未被验证。
           while IFS= read -r mod; do
             dir=$(dirname "$mod")
             [ "$dir" = "." ] && continue
             case "$dir" in
               ./vendor/*|./third_party/*|./testdata/*|./examples/*|./.git/*) continue ;;
             esac
-            echo "::group::tidy ${dir#./}"
-            (cd "$dir" && go mod tidy -diff)
+            tc=$(awk '/^go [0-9]/{print "go" $2; exit}' "$mod" | cut -d. -f1,2)
+            [ -n "$tc" ] || tc=local
+            echo "::group::tidy ${dir#./} (${tc})"
+            (cd "$dir" && GOTOOLCHAIN="$tc" go mod tidy -diff)
             echo "::endgroup::"
           done < <(find . -name go.mod -not -path './.git/*' | sort)
 
@@ -146,6 +150,11 @@ jobs:
         run: |
           set -euo pipefail
           found=0
+          # 每个嵌套模块用它**自己 go.mod 声明的 go 指令**对应的工具链跑
+          # （取 minor，与 setup-go 的 '1.24' 语义一致：解析为最新 1.24.x）。
+          # 以前所有嵌套模块都用父仓 CI 的 go-version 跑——于是
+          # bootstrap/nacos（声明 1.25）、timertask/redis（声明 1.24）都被在 1.26 下测，
+          # **子模块声明的最低版本从未被验证过**——那是空头支票。
           while IFS= read -r mod; do
             dir=$(dirname "$mod")
             [ "$dir" = "." ] && continue
@@ -153,8 +162,10 @@ jobs:
               ./vendor/*|./third_party/*|./testdata/*|./examples/*|./.git/*) continue ;;
             esac
             found=1
-            echo "::group::nested module ${dir#./}"
-            (cd "$dir" && go build ./... && go test -race -count=1 ./...)
+            tc=$(awk '/^go [0-9]/{print "go" $2; exit}' "$mod" | cut -d. -f1,2)
+            [ -n "$tc" ] || tc=local
+            echo "::group::nested module ${dir#./} (${tc})"
+            (cd "$dir" && GOTOOLCHAIN="$tc" go build ./... && GOTOOLCHAIN="$tc" go test -race -count=1 ./...)
             echo "::endgroup::"
           done < <(find . -name go.mod -not -path './.git/*' | sort)
           if [ "$found" -eq 0 ]; then
