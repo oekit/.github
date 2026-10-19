@@ -26,11 +26,6 @@ on:
         required: false
         type: string
         default: '3.12'
-      scripts-dir:
-        description: '存放脚本的目录（相对仓库根）'
-        required: false
-        type: string
-        default: 'scripts'
   workflow_dispatch:
     inputs:
       python-version:
@@ -38,11 +33,6 @@ on:
         required: false
         type: string
         default: '3.12'
-      scripts-dir:
-        description: '存放脚本的目录（相对仓库根）'
-        required: false
-        type: string
-        default: 'scripts'
 
 permissions:
   contents: read
@@ -65,13 +55,26 @@ jobs:
         run: |
           set -euo pipefail
           fail=0
+          # 扫**整个仓库**，不是某个 scripts/ 目录。
+          # 这是实测踩出来的盲区：matrix-tools 的 matrix.py 是所有脚本的
+          # 基础模块（事实源），却躺在仓库根而不是 scripts/ 下——只扫
+          # scripts/ 时，一个语法坏掉的 matrix.py 能全绿通过（它的 import
+          # 链断了，是 audit job 而不是 lint job 先发现的）。
+          # 基础模块比脚本更容易被漏：脚本在目录里顺理成章，库却常常在根。
           while IFS= read -r f; do
             echo "::group::py_compile ${f}"
             if ! python3 -m py_compile "$f"; then
               fail=1
             fi
             echo "::endgroup::"
-          done < <(find "${{ inputs.scripts-dir }}" -name '*.py' | sort)
+          done < <(find . -name '*.py' \
+                    -not -path './.git/*' \
+                    -not -path '*/__pycache__/*' \
+                    -not -path '*/node_modules/*' \
+                    -not -path '*/.venv/*' \
+                    -not -path '*/venv/*' \
+                    -not -path '*/site-packages/*' \
+                    -not -path '*/.mypy_cache/*' | sort)
           exit "$fail"
 
   shell-syntax:
@@ -90,7 +93,9 @@ jobs:
               fail=1
             fi
             echo "::endgroup::"
-          done < <(find "${{ inputs.scripts-dir }}" -name '*.sh' | sort)
+          done < <(find . -name '*.sh' \
+                    -not -path './.git/*' \
+                    -not -path '*/node_modules/*' | sort)
           exit "$fail"
 
   yaml:
