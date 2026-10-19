@@ -3,7 +3,7 @@
 oekit org 的 GitHub 统一规则仓：org profile + **全 org 共享的 CI 门禁（reusable workflows）**。
 
 各模块仓库的 `.github/workflows/ci.yml` 只保留一个薄调用层，规则本体统一在本仓维护——
-改一处（golangci-lint 版本、门禁步骤、覆盖率策略），所有引用 `@main` 的仓库立即生效。
+改一处（golangci-lint 版本、门禁步骤、覆盖率策略、Python 检查范围），所有引用 `@main` 的仓库立即生效。
 
 ## 治理大盘联动
 
@@ -86,6 +86,21 @@ gh auth refresh -s project
 | `govulncheck` | `true` | 漏洞扫描（pin v1.9.0）——**非阻塞报告**。扫描器自身要求 go≥1.26：pin≥1.26 的仓正常出报告，1.24/1.25 仓显示黄色注解但不阻塞；转阻塞门禁需先统一工具链（go 版本升级暂缓中）|
 | `tidy-check` | `true` | `go mod tidy -diff` 门禁（含嵌套子模块），检测 go.mod/go.sum 漂移（指向已删 tag 的版本地板、旧 import 路径等）|
 
+### `python-ci.yml` — Python 统一 CI 门禁
+
+与 `go-ci.yml` 对称的 Python 侧门禁，供规则仓/工具仓（`matrix-tools` 等）引用。
+
+步骤：**Python syntax**（`py_compile` 全仓 `.py`）→ **Shell syntax**（`bash -n` 全仓 `.sh`）→ **YAML**（workflows + templates + dependabot 全量解析）。
+
+| input | 默认 | 说明 |
+|---|---|---|
+| `python-version` | `'3.12'` | setup-python 语义，如 3.12 解析为最新 3.12.x |
+
+两条设计约束，改动时务必保留：
+
+- **扫全仓库，不只扫 `scripts/`**：基础模块比脚本更容易被漏——脚本在 `scripts/` 目录里顺理成章，库却常常躺在仓库根。实测 `matrix-tools` 的 `matrix.py`（所有脚本的事实源）就因此被漏检过，语法坏掉时门禁全绿。
+- **不执行脚本本体**：矩阵仓有一批脚本在缺少 `--help` 时会直接执行真实动作（发版、开 PR、写文件），盲跑冒烟会真的触发副作用。只有纯静态检查是安全且足够的。
+
 ### 模块仓库接入方式
 
 ```yaml
@@ -133,7 +148,7 @@ jobs:
 
 ### `repo-ci.yml` — 规则仓自身 CI
 
-规则本体的持续集成：`scripts/*.py` 语法与入口 smoke、`scripts/*.sh` bash 语法、workflow/模板 YAML 可解析。与 `workflow-lint.yml`（actionlint）互补。
+本仓自身的薄调用层：`lint` 引用同仓 `python-ci.yml@main`（与各模块仓共用同一份规则本体），`smoke` 保留本仓特有的一条——`sync-projects.py` 能跑起来。与 `workflow-lint.yml`（actionlint）互补。
 
 ### 组织 workflow 模板（`workflow-templates/`）
 
@@ -154,7 +169,7 @@ jobs:
 
 ## 运维
 
-- **改规则**：直接改本仓 `.github/workflows/go-ci.yml`，merge 即生效，无需动模块仓。
+- **改规则**：直接改本仓 `.github/workflows/go-ci.yml`（Go 门禁）或 `.github/workflows/python-ci.yml`（Python 门禁），merge 即生效，无需动模块仓。
 - **升级 action 版本**：本仓 dependabot（`github-actions` ecosystem，weekly）提 PR，merge 即全 org 生效。
 - **改治理大盘联动**：issue/PR 模板与 CONTRIBUTING 里的 Projects 链接/字段名；项目号（1/4）是稳定 ID，换板才需要改。
 - **手动补同步**：`python3 scripts/sync-projects.py --apply`（或 Actions → 大盘同步 → Run workflow）。
@@ -167,8 +182,9 @@ jobs:
 
 ```
 .github/workflows/go-ci.yml              # 共享 reusable workflow（Go 门禁规则本体）
+.github/workflows/python-ci.yml          # 共享 reusable workflow（Python 门禁规则本体）
 .github/workflows/issue-auto-assign.yml  # 新 issue 自动分配（可 reusable）
-.github/workflows/repo-ci.yml            # 规则仓自身脚本/YAML CI
+.github/workflows/repo-ci.yml            # 规则仓自身 CI（薄调用层 → python-ci.yml）
 .github/workflows/workflow-lint.yml      # 本仓 Actions 语法自检（actionlint）
 .github/workflows/issue-project-sync.yml # 大盘定时同步 workflow
 .github/dependabot.yml                   # 本仓 action 依赖自动升级
