@@ -89,8 +89,17 @@ jobs:
             case "$dir" in
               ./vendor/*|./third_party/*|./testdata/*|./examples/*|./.git/*) continue ;;
             esac
-            tc=$(awk '/^go [0-9]/{print "go" $2; exit}' "$mod" | cut -d. -f1,2)
-            [ -n "$tc" ] || tc=local
+            # GOTOOLCHAIN 只接受**完整工具链版本**（go1.24.0），不接受语言版本
+            # （go1.24）——后者会被 go 拒绝：invalid toolchain: go1.24 is a language
+            # version but not a toolchain version (go1.24.x)。
+            # go 指令写两段（1.24）时补 .0；写三段（1.24.0）直接用。
+            tc=$(awk '/^go [0-9]/{print $2; exit}' "$mod")
+            case "$tc" in
+              *.*.*) : ;;
+              *.*)   tc="$tc.0" ;;
+              *)     tc="" ;;
+            esac
+            [ -n "$tc" ] && tc="go$tc" || tc=local
             echo "::group::tidy ${dir#./} (${tc})"
             (cd "$dir" && GOTOOLCHAIN="$tc" go mod tidy -diff)
             echo "::endgroup::"
@@ -162,8 +171,17 @@ jobs:
               ./vendor/*|./third_party/*|./testdata/*|./examples/*|./.git/*) continue ;;
             esac
             found=1
-            tc=$(awk '/^go [0-9]/{print "go" $2; exit}' "$mod" | cut -d. -f1,2)
-            [ -n "$tc" ] || tc=local
+            # GOTOOLCHAIN 只接受**完整工具链版本**（go1.24.0），不接受语言版本
+            # （go1.24）——后者会被 go 拒绝：invalid toolchain: go1.24 is a language
+            # version but not a toolchain version (go1.24.x)。
+            # go 指令写两段（1.24）时补 .0；写三段（1.24.0）直接用。
+            tc=$(awk '/^go [0-9]/{print $2; exit}' "$mod")
+            case "$tc" in
+              *.*.*) : ;;
+              *.*)   tc="$tc.0" ;;
+              *)     tc="" ;;
+            esac
+            [ -n "$tc" ] && tc="go$tc" || tc=local
             echo "::group::nested module ${dir#./} (${tc})"
             (cd "$dir" && GOTOOLCHAIN="$tc" go build ./... && GOTOOLCHAIN="$tc" go test -race -count=1 ./...)
             echo "::endgroup::"
