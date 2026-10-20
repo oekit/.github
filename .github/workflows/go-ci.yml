@@ -253,7 +253,25 @@ jobs:
         continue-on-error: true
         run: |
           set -o pipefail
-          go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 ./... 2>&1 | tee govulncheck.txt
+          # 扫描工具**不是**被扫模块的一部分——它自己的 go 要求可能高于本仓地板
+          # （x/vuln v1.9.0 要求 go>=1.26，而本仓 CI 可能是 1.24）。setup-go 设的
+          # GOTOOLCHAIN=local 会让这一步**直接失败**，而 continue-on-error 把它吞掉 →
+          # **漏洞扫描静默跳过**，CI 摘要里看起来像「扫过、没漏洞」。
+          # 修法：给扫描用「至少本仓版本 + 允许自动升级」的工具链
+          # （实测 go1.24.0+auto 可跑通 go1.26 的 x/vuln；go1.24.0 则报 invalid toolchain）。
+          # 注意：构建/测试步骤仍用 setup-go 的工具链 + GOTOOLCHAIN=local，
+          # 「最低支持版本才真被验证」这条不受影响——这里只放宽扫描工具。
+          scan_tc=$(awk '/^go [0-9]/{print $2; exit}' go.mod)
+          case "$scan_tc" in
+            *.*.*) : ;;
+            *.*)   scan_tc="$scan_tc.0" ;;
+            *)     scan_tc="" ;;
+          esac
+          [ -n "$scan_tc" ] && scan_tc="go${scan_tc}+auto" || scan_tc=auto
+          GOTOOLCHAIN="$scan_tc" go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 ./... 2>&1 | tee govulncheck.txt
+          if grep -q "requires go >=" govulncheck.txt; then
+            echo "::warning::govulncheck **未能运行**（扫描工具要求的 Go 版本高于本仓 CI 工具链且无法自动切换）——本次**没有做漏洞扫描**，不要当成「无漏洞」"
+          fi
           {
             echo "## govulncheck"
             echo '```'
