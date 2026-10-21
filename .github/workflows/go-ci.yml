@@ -82,11 +82,30 @@ jobs:
           set -euo pipefail
           ok=0
           for i in 1 2 3 4 5; do
-            if go mod download; then
+            if out=$(go mod download 2>&1); then
               echo "deps downloaded (attempt $i)"
+              if [ -n "$out" ]; then echo "$out"; fi
               ok=1; break
             fi
-            echo "::warning::go mod download 失败（第 $i/5 次），$((i*15))s 后重试"
+            # 确定性错误重试无意义——**配置错误不是网络抖动**。
+            # 实测 2026-10-22：dependabot 把 go.mod 的 go 指令抬到 1.26.0，
+            # 而本仓 CI 钉 1.24（setup-go 设 GOTOOLCHAIN=local）⇒
+            # "go: go.mod requires go >= 1.26.0 (running go 1.24.13; GOTOOLCHAIN=local)"。
+            # 旧写法会重试 5 次白烧 ~3.5 分钟，且日志里只剩一句
+            # "go mod download 连续 5 次失败"，真实原因埋在重试噪声里。
+            case "$out" in
+              *"requires go >="*)
+                echo "::error::go mod download 失败（确定性错误，重试无意义）：$out"
+                echo "::error::Go 地板与依赖不匹配：依赖要求的 Go 版本高于本仓 go.mod / CI 声明的地板。"
+                echo "::error::矩阵口径见 matrix-tools：基础层钉 1.24、业务层允许 1.24/1.25/1.26、tracing 豁免；"
+                echo "::error::且 CI 的 go-version 必须与 go.mod 的 go 指令成对（否则最低支持版本从未被验证）。"
+                exit 1 ;;
+              *"invalid toolchain"*)
+                echo "::error::go mod download 失败（工具链版本写法非法，重试无意义）：$out"
+                exit 1 ;;
+            esac
+            echo "::warning::go mod download 失败（第 $i/5 次）：$out"
+            echo "::warning::$((i*15))s 后重试"
             sleep $((i*15))
           done
           [ "$ok" = "1" ] || { echo "::error::go mod download 连续 5 次失败"; exit 1; }
@@ -178,11 +197,30 @@ jobs:
           set -euo pipefail
           ok=0
           for i in 1 2 3 4 5; do
-            if go mod download; then
+            if out=$(go mod download 2>&1); then
               echo "deps downloaded (attempt $i)"
+              if [ -n "$out" ]; then echo "$out"; fi
               ok=1; break
             fi
-            echo "::warning::go mod download 失败（第 $i/5 次），$((i*15))s 后重试"
+            # 确定性错误重试无意义——**配置错误不是网络抖动**。
+            # 实测 2026-10-22：dependabot 把 go.mod 的 go 指令抬到 1.26.0，
+            # 而本仓 CI 钉 1.24（setup-go 设 GOTOOLCHAIN=local）⇒
+            # "go: go.mod requires go >= 1.26.0 (running go 1.24.13; GOTOOLCHAIN=local)"。
+            # 旧写法会重试 5 次白烧 ~3.5 分钟，且日志里只剩一句
+            # "go mod download 连续 5 次失败"，真实原因埋在重试噪声里。
+            case "$out" in
+              *"requires go >="*)
+                echo "::error::go mod download 失败（确定性错误，重试无意义）：$out"
+                echo "::error::Go 地板与依赖不匹配：依赖要求的 Go 版本高于本仓 go.mod / CI 声明的地板。"
+                echo "::error::矩阵口径见 matrix-tools：基础层钉 1.24、业务层允许 1.24/1.25/1.26、tracing 豁免；"
+                echo "::error::且 CI 的 go-version 必须与 go.mod 的 go 指令成对（否则最低支持版本从未被验证）。"
+                exit 1 ;;
+              *"invalid toolchain"*)
+                echo "::error::go mod download 失败（工具链版本写法非法，重试无意义）：$out"
+                exit 1 ;;
+            esac
+            echo "::warning::go mod download 失败（第 $i/5 次）：$out"
+            echo "::warning::$((i*15))s 后重试"
             sleep $((i*15))
           done
           [ "$ok" = "1" ] || { echo "::error::go mod download 连续 5 次失败"; exit 1; }
@@ -228,10 +266,22 @@ jobs:
               cd "$dir"
               ok=0
               for i in 1 2 3 4 5; do
-                if GOTOOLCHAIN="$tc" go mod download; then
+                if out=$(GOTOOLCHAIN="$tc" go mod download 2>&1); then
+                  if [ -n "$out" ]; then echo "$out"; fi
                   ok=1; break
                 fi
-                echo "::warning::nested $dir 依赖下载失败（第 $i/5 次），$((i*15))s 后重试"
+                # 同上：地板/工具链不匹配是确定性错误，重试无意义
+                case "$out" in
+                  *"requires go >="*)
+                    echo "::error::nested $dir 依赖下载失败（确定性错误，重试无意义）：$out"
+                    echo "::error::嵌套模块声明的 go 版本与依赖要求不匹配——检查 $mod 的 go 指令与依赖的最低 Go 版本。"
+                    exit 1 ;;
+                  *"invalid toolchain"*)
+                    echo "::error::nested $dir 依赖下载失败（工具链版本写法非法，重试无意义）：$out"
+                    exit 1 ;;
+                esac
+                echo "::warning::nested $dir 依赖下载失败（第 $i/5 次）：$out"
+                echo "::warning::$((i*15))s 后重试"
                 sleep $((i*15))
               done
               [ "$ok" = "1" ] || { echo "::error::nested $dir 依赖连续 5 次拉取失败"; exit 1; }

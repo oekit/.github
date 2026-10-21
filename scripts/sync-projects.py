@@ -41,15 +41,34 @@ PROJECT_PR = 4
 # ---------------------------------------------------------------------------
 
 
+def _gh_run(argv: list[str]) -> str:
+    """跑 gh 并返回 stdout；失败时把 **gh 自己的报错** 抛出来。
+
+    原实现是 `check_output(..., stderr=subprocess.PIPE)` ⇒ gh 的真实报错被吞进
+    管道，调用方只拿到一句 `returned non-zero exit status 4`，日志里看不到
+    「为什么」。实测 2026-10-22：全 org 7 个 dependabot PR 的「即时入板」job
+    全红，真实原因是 `To get started with GitHub CLI, please run: gh auth login`
+    ——而这句话当时根本不在日志里，只有一个退出码。
+    """
+    p = subprocess.run(["gh", *argv], capture_output=True, text=True)
+    if p.returncode != 0:
+        detail = (p.stderr or p.stdout or "").strip()
+        raise RuntimeError(
+            f"gh {' '.join(argv)} 失败（exit {p.returncode}）："
+            f"{detail[:800] or '(无输出)'}"
+        )
+    return p.stdout
+
+
 def gql(query: str, **variables: str) -> dict:
-    args = ["gh", "api", "graphql", "-f", f"query={query}"]
+    args = ["api", "graphql", "-f", f"query={query}"]
     for k, v in variables.items():
         # Int! project number needs typed JSON; everything else stays string
         if k == "number" and str(v).isdigit():
             args += ["-F", f"{k}={v}"]
         else:
             args += ["-f", f"{k}={v}"]
-    out = subprocess.check_output(args, text=True, stderr=subprocess.PIPE)
+    out = _gh_run(args)
     data = json.loads(out)
     if "errors" in data:
         raise RuntimeError(data["errors"])
@@ -57,8 +76,71 @@ def gql(query: str, **variables: str) -> dict:
 
 
 def gh_json(argv: list[str]) -> object:
-    out = subprocess.check_output(["gh", *argv], text=True, stderr=subprocess.PIPE)
+    out = _gh_run(argv)
     return json.loads(out) if out.strip() else None
+
+
+def gh_auth_ready() -> bool:
+    """gh 此刻有没有可用凭证。
+
+    **Dependabot 触发的工作流拿不到 repo secret**：GitHub 只把 secret 暴露给
+    Dependabot 自己声明的 `dependabot` 命名空间；普通 `pull_request` 触发里
+    `secrets.OEKIT_PROJECT_TOKEN` 求值成空串。而 CI 机器上没有 gh 的
+    hosts.yml ⇒ gh 完全未认证 ⇒ `gh api` 以 **exit 4** 退出
+    （"To get started with GitHub CLI, please run: gh auth login"）。
+
+    实测 2026-10-22：全 org 7 个 dependabot PR 的「即时入板」job 全红，
+    人工 PR 全绿。**红是假的**——代价是红色淹没真信号（这正是「门禁要少而致命」
+    的反面）。依赖类 PR 本来也不该进人工审查队列，所以正确处置是**跳过**，
+    而不是让整条 job 假红。
+
+    注意：token **存在但无效**时这里返回 True —— 那是真的配置错误，应该响亮地红。
+    """
+    if os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN"):
+        return True
+    p = subprocess.run(["gh", "auth", "status"], capture_output=True, text=True)
+    return p.returncode == 0
+
+
+def is_dependabot_run() -> bool:
+    """这次运行是不是 Dependabot 触发的。
+
+    Dependabot 触发的工作流**拿不到仓库 secret** —— GitHub 只把 secret 暴露给
+    Dependabot 自己声明的 `dependabot` 命名空间；普通 `pull_request` 触发里
+    `secrets.OEKIT_PROJECT_TOKEN` 求值成空串。而 CI 机器上没有 gh 的
+    hosts.yml ⇒ gh 完全未认证 ⇒ `gh api` 以 **exit 4** 退出
+    （"To get started with GitHub CLI, please run: gh auth login"）。
+
+    实测 2026-10-22：全 org 7 个 dependabot PR 的「即时入板」job 全红，
+    人工 PR 全绿。**红是假的**——代价是红色淹没真信号（这正是「门禁要少而致命」
+    的反面）。依赖类 PR 本来也不该进人工审查队列，所以正确处置是**跳过**，
+    而不是让整条 job 假红。
+
+    判据用 `GITHUB_ACTOR`：Dependabot 开 PR 时 actor 就是 `dependabot[bot]`；
+    人工合并后的 push 事件 actor 是合并者（不是 dependabot）⇒ secret 照常可用。
+    """
+    return os.environ.get("GITHUB_ACTOR") == "dependabot[bot]"
+
+
+def no_credential_reason() -> str | None:
+    """当前进程有没有可用 GitHub 凭证；没有则返回原因（可用返回 None）。
+
+    分两种「没有」——**处置完全不同**：
+
+    - **Dependabot 触发的工作流**：仓库 secret 拿不到（见 is_dependabot_run
+      的注释）⇒ 这是**预期内**的 ⇒ 跳过同步，不要让整条 job 假红。
+    - **其他运行**却也没凭证：secret 没建 / 没授权 ⇒ 真配置错误 ⇒ 必须响亮地红。
+    """
+    if os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN"):
+        return None
+    if gh_auth_ready():
+        return None
+    if is_dependabot_run():
+        return (
+            "Dependabot 触发的工作流拿不到仓库 secret"
+            "（GitHub 只把 secret 暴露给 Dependabot 自己声明的 dependabot 命名空间）"
+        )
+    return "GH_TOKEN / GITHUB_TOKEN 为空，且 gh 本地无凭证"
 
 
 def parse_github_url(url: str) -> tuple[str, int, str]:
@@ -977,6 +1059,23 @@ def main() -> int:
         help="事件驱动：刷新单模块的版本矩阵 + 矩阵健康（tag/README 变更后）",
     )
     args = ap.parse_args()
+
+    # 凭证前置检查——**所有**模式都要过这一关（连 dry-run 也会调 API）。
+    # 放在最前面是有意的：没有凭证时任何一步都会以 exit 4 崩在 gh 的调用上，
+    # 报错还落在最内层，看不出「是没凭证」这件真正的事。
+    reason = no_credential_reason()
+    if reason is not None:
+        if is_dependabot_run():
+            print(
+                f"::warning::{reason}——跳过看板同步。"
+                "依赖类 PR 不进人工审查队列是预期行为；看板对齐由每小时定时任务兜底。"
+            )
+            return 0
+        print(
+            f"::error::{reason}——看板同步需要 OEKIT_PROJECT_TOKEN"
+            "（scope: project + read:org）"
+        )
+        return 1
 
     if args.link:
         link_item(args.link, args.state)
