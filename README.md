@@ -36,7 +36,7 @@ GitHub Projects **不会**自动纳入 issue/PR，也不会跟进 tag。本仓�
 |---|---|---|
 | 各仓 `issue-to-project.yml` | issue/PR 开关、tag 推送、main 提交 | **秒级**入板/刷新（`--link` / `--refresh-module`） |
 | `issue-project-sync.yml` | 每小时 + 手动 | 全量对齐四块大盘（`--apply`） |
-| `scripts/sync-project-hooks.sh` | 手动 | 给各模块仓装 hook + secret |
+| `scripts/sync-project-hooks.sh` | 手动 | 给各模块仓装 hook + secret（默认逐仓开分支提 PR；`--push` 直写 main 仅适用于无分支保护的仓） |
 
 同步规则：
 
