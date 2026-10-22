@@ -35,7 +35,7 @@ jobs:
     timeout-minutes: 5
     steps:
       - name: Auto-assign maintainers
-        uses: actions/github-script@v7
+        uses: actions/github-script@v9
         env:
           # workflow_call 走 inputs；直接 issues 事件用同一默认
           ASSIGNEES: ${{ inputs.assignees || 'zy84338719' }}
