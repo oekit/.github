@@ -15,7 +15,7 @@ jobs:
     timeout-minutes: 5
     steps:
       - name: Auto-assign maintainers
-        uses: actions/github-script@v7
+        uses: actions/github-script@v9
         env:
           # 改成你的维护者 login，逗号分隔可多人
           ASSIGNEES: ${{ github.repository_owner }}
