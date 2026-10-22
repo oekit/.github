@@ -52,3 +52,24 @@ jobs:
         run: |
           python3 scripts/board_query.py --help >/dev/null
           python3 scripts/board_query.py --selftest
+
+  # 本体/副本 pin 一致性门禁：**只在本仓跑**（别的仓没有 workflow-templates/，
+  # 挂进共享 python-ci.yml 会让它们误红）。
+  #
+  # 为什么需要它：dependabot 的 github-actions ecosystem 只扫 .github/workflows/，
+  # 扫不到 workflow-templates/（本体）⇒ 副本被升级而本体陈旧 ⇒
+  # sync-project-hooks.sh 下次把陈旧本体回灌到 28 份副本，把升级 revert 掉。
+  # 这个回灌发生在手工脚本里，此前**没有任何门禁会报**（2026-10-23 实测）。
+  template-pins:
+    name: Template pins
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - name: 本体不得落后于实际 workflow 的 action pin
+        run: python3 scripts/check_template_pins.py
+      - name: 门禁自测（变异测试：判据失效必须红）
+        run: python3 scripts/check_template_pins.py --selftest
