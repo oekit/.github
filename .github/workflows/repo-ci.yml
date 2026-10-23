@@ -45,3 +45,10 @@ jobs:
         run: |
           python3 scripts/sync-projects.py --help >/dev/null
           python3 -c "import ast, pathlib; ast.parse(pathlib.Path('scripts/sync-projects.py').read_text())"
+      # 看板权威读路径：读 issue 侧 projectItems，不读 projectV2.items 分页
+      # （分页滞后 ⇒ 「已入板」被判成「不在板上」= 假阴性，oekit/.github#24）。
+      # 自测是变异测试：判据失效必须红，否则这道门禁只是摆设。
+      - name: board_query.py smoke + 门禁自测（变异测试：判据失效必须红）
+        run: |
+          python3 scripts/board_query.py --help >/dev/null
+          python3 scripts/board_query.py --selftest

@@ -24,11 +24,28 @@ MODE=pr
 TOKEN=$(gh auth token)
 
 MODULES=(
-  pkg concurrency logx core metrics tracing registry
-  data gormx redisx httpx network timertask middleware
-  nns nns-endpoint bootstrap hertz kitex workflow kitex-examples
+  pkg concurrency logx core kitx metrics tracing registry
+  data gormx redisx etcdx httpx network timertask middleware
+  k8s nns nns-endpoint bootstrap hertz kitex workflow kitex-examples
   matrix-tools oekit oekit.github.io .github
 )
+
+# 下发范围 = **矩阵全部根模块**（matrix.py 的 MODULES，25 个）+ 4 个 infra 仓
+# （matrix-tools / oekit / oekit.github.io / .github）= 28 份副本。
+#
+# 为什么是「全部根模块」而不是「挑一部分」（2026-10-23 实测，oekit/.github#24）：
+# 看板（Issue 大盘）本身就是 **org 全量**的——oekit/.github 的整点同步
+# （issue-project-sync.yml → sync-projects.py --apply）用
+# `gh search issues --owner oekit` 拉**全 org** 的 issue 入板，
+# Module 由仓名推导（infer_module），Module 选项覆盖全部矩阵模块。
+# ⇒ 「某仓的 issue 进不进大盘」从来不取决于本脚本；本脚本只决定
+#   **进板延迟**：秒级（即时入板 workflow）还是 ≤1 小时（整点全量同步兜底）。
+# ⇒ 曾经漏掉的 kitx / etcdx / k8s（拆仓或新增时没带进来）就是「秒级 → 小时级」
+#   的静默降级，本轮补齐。
+#
+# ⚠️ 若某仓**故意**不要秒级链路，必须两处同时改：这里删掉它，
+#    并在 Issue 大盘的 Module 选项里同步处理——否则会出现
+#    「板上有它的 Module 选项、却永远没有它的条目」这种悬空状态。
 
 # 参数解析：--pr / --push / --dry 决定模式，其余参数是仓库白名单。
 ONLY=()
