@@ -41,6 +41,12 @@ GitHub Projects **不会**自动纳入 issue/PR，也不会跟进 tag。本仓�
 同步规则：
 
 1. **Issue 大盘** — org issue 缺则入板；`state=open→Todo / closed→Done`；`Kind` 按标题打分推导（Bug/Enhancement/Refactor/Docs/Chore，**每次覆盖**，人工微调请用 Labels）；`Module`=所属仓
+   - **入板范围 = 全 org**：整点全量同步用 `gh search issues --owner oekit` 拉全量 issue，
+     所以「某仓的 issue 进不进大盘」与下发无关；各仓的 `issue-to-project.yml`
+     只决定**延迟**（秒级 vs ≤1 小时），下发范围 = 矩阵全部根模块 + 4 个 infra 仓；
+   - **读路径以 issue 侧为准**：断言「某 issue 在不在看板上」读 `issue.projectItems`
+     （`scripts/board_query.py`）——`projectV2.items` 分页**滞后**于 issue 侧，
+     用分页判会把「已入板」误判成「不在板上」（假阴性，oekit/.github#24）。
 2. **版本大盘** — 主模块与嵌套模块独立成行（Title=`logx` / `logx/hlog`）；`Latest`/`Prior`=近两版 root tag；`Parent` 标嵌套归属；缺行自动补
 3. **矩阵健康** — `Install`/`Tag` 并排对照 + `Note` 诊断；`Hygiene`（全绿 / 有漂移 / 待审计）+ `Drift` 0/1
 4. **PR 审查队列** — org PR 缺则入队；`open→待审 / merged→已合入 / closed→已关闭`；`Scope` 按 conventional commit 类型（build/deps → deps）
