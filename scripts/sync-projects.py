@@ -23,6 +23,7 @@ Projects v2 不会自动跟进 org 的 issue/PR/tag，本脚本补齐：
 from __future__ import annotations
 
 import argparse
+import datetime
 import json
 import os
 import re
@@ -35,6 +36,17 @@ PROJECT_ISSUE = 1
 PROJECT_VERSION = 2
 PROJECT_HEALTH = 3
 PROJECT_PR = 4
+
+# 「近期变更」视图的滚动窗口：名字 + 天数（起点 = 今天 - N 天）
+RECENT_VIEW_NAME = "近期变更"
+RECENT_WINDOW_DAYS = 7
+
+# 钉死的语义型视图过滤器（值固定，不需要滚动）
+PINNED_VIEW_FILTERS = {
+    # 「嵌套模块」= Parent 非空的那些行。
+    # 旧值 `nested:*` 里的 nested 不是 Projects DSL 的字段名 ⇒ 该视图恒为 0 行。
+    "嵌套模块": "parent:*",
+}
 
 # ---------------------------------------------------------------------------
 # helpers
@@ -830,6 +842,101 @@ def delete_item(pid: str, item_id: str) -> None:
     )
 
 
+def project_views(number: int) -> tuple[str, list[dict]]:
+    """返回 (project id, 视图列表)。视图 id 会变，故按**名字**定位，不写死 id。"""
+    data = gql(
+        """
+        query($org: String!, $number: Int!) {
+          organization(login: $org) {
+            projectV2(number: $number) {
+              id
+              views(first: 20) { nodes { id name filter } }
+            }
+          }
+        }
+        """,
+        org=ORG,
+        number=str(number),
+    )
+    proj = data["organization"]["projectV2"]
+    return proj["id"], proj["views"]["nodes"]
+
+
+def roll_recent_changes_view(apply: bool) -> None:
+    """滚动「近期变更」视图的过滤窗口：updated:>=<今天 - N 天>。
+
+    Projects 的过滤器 DSL **只认固定日期**——相对日期会被判非法
+    （实测 `updated:>=now-7d` ⇒ "Invalid value >=now-7d for updated.
+    Fix by using date format YYYY-MM-DD"）。
+    ⇒ 窗口必须有人滚，否则视图单调膨胀成「全部行」，「近期变更」名存实亡。
+
+    每轮同步滚一次（日期没变就不写 ⇒ 一天最多一次 API 写）。
+    写失败只告警不抛错：视图配置不是看板数据，挂了不该拖垮整轮同步。
+    """
+    try:
+        _pid, views = project_views(PROJECT_VERSION)
+    except Exception as exc:
+        print(f"  ! 读取视图列表失败（{exc}）——跳过窗口滚动")
+        return
+    target = next((v for v in views if v.get("name") == RECENT_VIEW_NAME), None)
+    if not target:
+        print(f"  ! 视图「{RECENT_VIEW_NAME}」不存在——跳过窗口滚动")
+        return
+    start = (
+        datetime.date.today() - datetime.timedelta(days=RECENT_WINDOW_DAYS)
+    ).isoformat()
+    want = f"updated:>={start}"
+    cur = target.get("filter") or ""
+    if cur == want:
+        return
+    print(f"  ~ {RECENT_VIEW_NAME} 窗口：{cur or '(空)'} → {want}")
+    if not apply:
+        return
+    _write_view_filter(target["id"], want)
+
+
+def sync_pinned_view_filters(apply: bool) -> None:
+    """钉死语义型视图的过滤器（值固定，不需要滚动）。
+
+    「嵌套模块」= Parent 非空的那些行 ⇒ `parent:*`。
+    旧值 `nested:*` 是个**不存在的字段名**（Projects DSL 里没有 nested 这个字段）
+    ⇒ 该视图恒为空（实测 0 行），而且看板上不报错——只能靠对账发现。
+    """
+    try:
+        _pid, views = project_views(PROJECT_VERSION)
+    except Exception as exc:
+        print(f"  ! 读取视图列表失败（{exc}）——跳过过滤器对齐")
+        return
+    by_name = {v.get("name"): v for v in views}
+    for name, want in PINNED_VIEW_FILTERS.items():
+        v = by_name.get(name)
+        if not v:
+            print(f"  ! 视图「{name}」不存在——跳过过滤器对齐")
+            continue
+        cur = v.get("filter") or ""
+        if cur == want:
+            continue
+        print(f"  ~ {name} 过滤器：{cur or '(空)'} → {want}")
+        if apply:
+            _write_view_filter(v["id"], want)
+
+
+def _write_view_filter(view_id: str, want: str) -> None:
+    """写视图过滤器；失败只告警不抛错（视图配置挂了不该拖垮看板同步）。"""
+    try:
+        gql(
+            f"""
+            mutation {{
+              updateProjectV2View(input: {{
+                viewId: "{view_id}", filter: "{want}"
+              }}) {{ projectV2View {{ id name filter }} }}
+            }}
+            """
+        )
+    except Exception as exc:
+        print(f"  ! 写视图过滤器失败（{exc}）——看板数据不受影响，继续")
+
+
 def add_draft(pid: str, title: str, body: str = "") -> str:
     esc_t = title.replace("\\", "\\\\").replace('"', '\\"')
     esc_b = body.replace("\\", "\\\\").replace('"', '\\"')
@@ -1203,6 +1310,10 @@ def refresh_module(mod: str) -> None:
                 layer=parent_layer,
             )
 
+    # tag 推送 = 一次「近期变更」⇒ 顺手把窗口滚到包含今天
+    sync_pinned_view_filters(True)
+    roll_recent_changes_view(True)
+
     # ---- 矩阵健康 ----
     hproj = load_project(PROJECT_HEALTH)
     hy_opts = opt_map(hproj["fields"].get("Hygiene"))
@@ -1357,6 +1468,8 @@ def main() -> int:
         sync_pr_board(args.apply)
     if only in (None, 2):
         sync_version_board(args.apply)
+        sync_pinned_view_filters(args.apply)
+        roll_recent_changes_view(args.apply)
     if only in (None, 3):
         sync_health_board(args.apply)
     print("\nOK")
