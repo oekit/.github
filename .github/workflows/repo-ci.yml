@@ -45,6 +45,11 @@ jobs:
         run: |
           python3 scripts/sync-projects.py --help >/dev/null
           python3 -c "import ast, pathlib; ast.parse(pathlib.Path('scripts/sync-projects.py').read_text())"
+      # 版本大盘行集合的门禁：清单漂移 / 多层嵌套 tag 解析 / Layer 覆盖。
+      # 2026-10-25 之前没有这道门禁，手抄清单与 matrix.py 漂移（21 vs 24），
+      # 代价是看板长期缺 kitx/etcdx/k8s + kitexotel 四行，且不报错。
+      - name: sync-projects.py selftest（真相源漂移 / 嵌套解析）
+        run: python3 scripts/sync-projects.py --selftest
       # 看板权威读路径：读 issue 侧 projectItems，不读 projectV2.items 分页
       # （分页滞后 ⇒ 「已入板」被判成「不在板上」= 假阴性，oekit/.github#24）。
       # 自测是变异测试：判据失效必须红，否则这道门禁只是摆设。

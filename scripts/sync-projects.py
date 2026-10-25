@@ -638,23 +638,116 @@ def sync_pr_board(apply: bool) -> None:
 # 版本大盘 + 矩阵健康
 # ---------------------------------------------------------------------------
 
-MODULES = [
-    "pkg", "concurrency", "logx", "core", "metrics", "tracing", "registry",
-    "data", "gormx", "redisx", "httpx", "network", "timertask", "middleware",
-    "nns", "nns-endpoint", "bootstrap", "hertz", "kitex", "workflow",
-    "kitex-examples",
+# ---------------------------------------------------------------------------
+# 模块清单：真相源 = matrix-tools/matrix.py（唯一事实源）
+# ---------------------------------------------------------------------------
+#
+# 为什么不能在本文件里手抄一份（2026-10-25 实测踩坑）：
+#   本文件原来硬编码 21 个模块，而 matrix.py 早已扩到 24 个（+kitx / +etcdx / +k8s）
+#   ⇒ 版本大盘少 3 行主模块，且**每小时的全量同步不会补**（它读的就是这份硬编码
+#     清单）。副本漂移的形态是「静默少数据」：看板自己不会报错，只是一直缺行。
+#   同理，嵌套模块原来靠**扫 tag**发现 ⇒ 真源已删掉的模块（data/all，目录已删、
+#     仓库里还留着 all/v0.1.1 旧 tag）会被当成「活模块」重新建行 ⇒ 陈旧行删不掉，
+#     每次全量同步还会把它复活。
+#
+# 现在：真相源优先从 matrix.py 读（本地工作区 / CI 都可指过去），读不到时用内嵌
+# 副本兜底（CI 里只 checkout 了本仓），并且**比对两份是否一致**——不一致就显式
+# 告警，把「静默少数据」变成「显式漂移」。
+_FALLBACK_MODULES = [
+    "pkg", "concurrency", "logx", "core", "kitx",
+    "metrics", "tracing", "registry",
+    "data", "gormx", "redisx", "etcdx", "httpx", "network", "timertask",
+    "middleware", "k8s",
+    "nns", "nns-endpoint",
+    "bootstrap", "hertz", "kitex", "workflow", "kitex-examples",
 ]
 
-# 主模块默认 Layer（新行落板时用；嵌套行继承父级）
+# 嵌套模块：(父仓, 仓内路径) —— 与 matrix.py 的 NESTED_MODULES 同构。
+# 注意 kitex 有一条**多层**路径：observability/tracing/instrumentation/kitexotel。
+_FALLBACK_NESTED = [
+    ("bootstrap", "nacos"), ("bootstrap", "obs"),
+    ("logx", "sink"), ("logx", "hlog"), ("logx", "hertzlog"), ("logx", "kitexlog"),
+    ("timertask", "redis"),
+    ("registry", "nacosimpl"), ("registry", "nacos"),
+    ("kitex", "observability/tracing/instrumentation/kitexotel"), ("kitex", "istio"),
+]
+
+# 主模块默认 Layer（新行落板时用；嵌套行继承父级）。
+# 取自站点 docs/index.md 的「能力层」分组：基础库→基础、数据访问→数据、
+# 通信·服务治理→网络/治理、应用引导·框架生态→服务（workflow→工具、示例→示例）。
 LAYER_BY_MODULE = {
-    "pkg": "基础", "concurrency": "基础", "logx": "基础", "core": "基础",
-    "metrics": "基础", "tracing": "基础",
-    "registry": "治理", "nns": "治理", "nns-endpoint": "治理",
-    "data": "数据", "gormx": "数据", "redisx": "数据", "timertask": "数据",
+    "pkg": "基础", "concurrency": "基础", "core": "基础", "kitx": "基础",
+    "logx": "基础", "metrics": "基础", "tracing": "基础",
+    "data": "数据", "gormx": "数据", "redisx": "数据", "etcdx": "数据",
+    "timertask": "数据",
     "httpx": "网络", "network": "网络",
+    "registry": "治理", "nns": "治理", "nns-endpoint": "治理",
     "middleware": "服务", "bootstrap": "服务", "hertz": "服务", "kitex": "服务",
+    "k8s": "服务",
     "workflow": "工具", "kitex-examples": "示例",
 }
+
+
+def _matrix_truth_path() -> Path | None:
+    """定位 matrix-tools/matrix.py（模块矩阵唯一事实源）。找不到返回 None。
+
+    探测顺序：MATRIX_TOOLS_PATH 环境变量 → 本仓克隆的兄弟目录 → 当前工作目录。
+    本仓（oekit/.github）克隆在 <workspace>/.github ⇒ 兄弟目录即
+    <workspace>/matrix-tools/matrix.py。
+    """
+    cands: list[Path] = []
+    env = os.environ.get("MATRIX_TOOLS_PATH")
+    if env:
+        p = Path(env)
+        cands.append(p / "matrix.py" if p.is_dir() else p)
+    here = Path(__file__).resolve()
+    cands.append(here.parents[2] / "matrix-tools" / "matrix.py")
+    cands.append(Path.cwd() / "matrix-tools" / "matrix.py")
+    cands.append(Path.cwd().parent / "matrix-tools" / "matrix.py")
+    for c in cands:
+        try:
+            if c.is_file():
+                return c
+        except OSError:
+            continue
+    return None
+
+
+def load_truth() -> tuple[list[str], list[tuple[str, str]], str]:
+    """返回 (主模块清单, 嵌套清单[(父仓, 路径)], 来源说明)。
+
+    真相源 = matrix.py；读不到时退回内嵌副本并说明来源（不是静默）。
+    """
+    path = _matrix_truth_path()
+    if path is None:
+        return (
+            list(_FALLBACK_MODULES),
+            list(_FALLBACK_NESTED),
+            "内嵌副本（未找到 matrix.py）",
+        )
+    try:
+        import importlib.util
+
+        spec = importlib.util.spec_from_file_location("oekit_matrix_truth", path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        modules = list(mod.MODULES)
+        nested = [(n["repo"], n["path"]) for n in mod.NESTED_MODULES]
+    except Exception as exc:  # 真相源坏了 ⇒ 用副本兜底，但要说出来
+        print(f"::warning::真相源 {path} 读取失败（{exc}）——退回内嵌副本")
+        return (
+            list(_FALLBACK_MODULES),
+            list(_FALLBACK_NESTED),
+            f"内嵌副本（{path} 读取失败）",
+        )
+    if modules != list(_FALLBACK_MODULES) or nested != list(_FALLBACK_NESTED):
+        print(
+            f"::warning::内嵌副本与真相源 {path} 不一致"
+            f"（副本 {len(_FALLBACK_MODULES)} 主/{len(_FALLBACK_NESTED)} 嵌套，"
+            f"真相源 {len(modules)} 主/{len(nested)} 嵌套）——以真相源为准；"
+            "请把 scripts/sync-projects.py 的 _FALLBACK_* 更新到一致"
+        )
+    return modules, nested, str(path)
 
 
 def latest_tags(repo: str) -> list[str]:
@@ -668,8 +761,25 @@ def latest_tags(repo: str) -> list[str]:
     return root
 
 
+def parse_nested_tag(tag: str) -> tuple[str, str] | None:
+    """拆嵌套 tag：<仓内路径>/vX.Y.Z → (路径, 版本)。不是嵌套 tag 返回 None。
+
+    ⚠️ 必须 **rsplit** 而不是 split：嵌套路径可以是多层的
+    （kitex 的 observability/tracing/instrumentation/kitexotel）。
+    split("/", 1) 会把 path 切成 "observability"、ver 切成
+    "tracing/instrumentation/kitexotel/v0.1.0" ⇒ 版本号正则不匹配 ⇒
+    这个嵌套模块永远发现不了（2026-10-25 实测：kitexotel 在看板上一直缺行）。
+    """
+    if "/" not in tag:
+        return None
+    path, ver = tag.rsplit("/", 1)
+    if not re.fullmatch(r"v\d+\.\d+\.\d+", ver):
+        return None
+    return path, ver
+
+
 def nested_tags(repo: str) -> dict[str, list[str]]:
-    """嵌套模块 tag：path/vX.Y.Z → {path: [ver, ...] 新→旧}。"""
+    """嵌套模块 tag：<仓内路径>/vX.Y.Z → {路径: [ver, ...] 新→旧}。"""
     raw = subprocess.check_output(
         ["gh", "api", f"repos/{ORG}/{repo}/tags?per_page=100", "--jq", "[.[].name]"],
         text=True,
@@ -677,11 +787,11 @@ def nested_tags(repo: str) -> dict[str, list[str]]:
     tags = json.loads(raw)
     out: dict[str, list[str]] = {}
     for t in tags:
-        if "/" not in t:
+        parsed = parse_nested_tag(t)
+        if parsed is None:
             continue
-        path, ver = t.split("/", 1)
-        if re.fullmatch(r"v\d+\.\d+\.\d+", ver):
-            out.setdefault(path, []).append(ver)
+        path, ver = parsed
+        out.setdefault(path, []).append(ver)
 
     def key(v: str) -> tuple[int, ...]:
         return tuple(int(x) for x in v.lstrip("v").split("."))
@@ -689,6 +799,35 @@ def nested_tags(repo: str) -> dict[str, list[str]]:
     for p in out:
         out[p].sort(key=key, reverse=True)
     return out
+
+
+def module_exists(title: str) -> bool:
+    """看板行对应的仓（或仓内目录）是否**仍然存在**。
+
+    title 形如 `data`（主模块）或 `data/all`（嵌套模块）。
+    用于陈旧行清理：矩阵真源已移除、且仓/路径在 GitHub 上确实没了 ⇒ 才是陈旧行。
+    反之（矩阵外的单元，如伞仓 oekit / matrix-tools / .github）一律不动。
+    """
+    if "/" in title:
+        repo, path = title.split("/", 1)
+        argv = ["gh", "api", f"repos/{ORG}/{repo}/contents/{path}"]
+    else:
+        argv = ["gh", "api", f"repos/{ORG}/{title}"]
+    p = subprocess.run(argv, capture_output=True, text=True)
+    return p.returncode == 0
+
+
+def delete_item(pid: str, item_id: str) -> None:
+    """删掉看板行（陈旧行清理用）。"""
+    gql(
+        f"""
+        mutation {{
+          deleteProjectV2Item(input: {{
+            projectId: "{pid}", itemId: "{item_id}"
+          }}) {{ clientMutationId }}
+        }}
+        """
+    )
 
 
 def add_draft(pid: str, title: str, body: str = "") -> str:
@@ -730,6 +869,10 @@ def sync_version_board(apply: bool) -> None:
     """版本矩阵：Title=模块路径，主模块与嵌套模块独立成行。
 
     嵌套行 title 形如 `logx/hlog`，Parent=父模块名；主模块 Parent 留空。
+
+    行集合 = 矩阵真相源（MODULES + NESTED_MODULES），**不是**扫 tag 发现的：
+    扫 tag 会把「真源已删、但仓库还留着旧 tag」的模块（如 data/all）当成活模块，
+    于是陈旧行删不掉、每轮全量同步还会把它复活（2026-10-25 实测）。
     """
     print("\n=== #2 版本大盘 ===")
     proj = load_project(PROJECT_VERSION)
@@ -738,6 +881,12 @@ def sync_version_board(apply: bool) -> None:
     parent_id = proj["fields"].get("Parent", {}).get("id")
     layer_id = proj["fields"].get("Layer", {}).get("id")
     layer_opts = opt_map(proj["fields"].get("Layer"))
+
+    modules, nested, src = load_truth()
+    print(f"  真相源：{src}（{len(modules)} 主模块 / {len(nested)} 嵌套模块）")
+    missing_layer = [m for m in modules if m not in LAYER_BY_MODULE]
+    if missing_layer:
+        print(f"  ::warning::以下模块缺 Layer 归属（不会建行/刷层位）：{missing_layer}")
 
     # Title 一律精确匹配模块路径（历史 `pkg @ v0.7.0` 形式仅兼容读取）
     by_title: dict[str, dict] = {}
@@ -773,10 +922,14 @@ def sync_version_board(apply: bool) -> None:
         cur_l = item["fv"].get("Latest")
         cur_p = item["fv"].get("Prior")
         cur_parent = item["fv"].get("Parent")
+        cur_layer = item["fv"].get("Layer")
         need = False
         if cur_l != latest or (prior and cur_p != prior):
             need = True
         if parent_id and (cur_parent or "") != (parent or ""):
+            need = True
+        # 层位也要能刷新：原来只更 Latest/Prior，层位改了永远刷不上
+        if layer_id and layer and layer in layer_opts and (cur_layer or "") != layer:
             need = True
         if not need:
             return
@@ -790,21 +943,50 @@ def sync_version_board(apply: bool) -> None:
             set_field(proj["id"], item["id"], prior_id, text=prior)
         if parent_id:
             set_field(proj["id"], item["id"], parent_id, text=parent or "")
+        if layer_id and layer and layer in layer_opts and (cur_layer or "") != layer:
+            set_field(proj["id"], item["id"], layer_id, option_id=layer_opts[layer])
 
-    for mod in MODULES:
+    nested_by_repo: dict[str, list[str]] = {}
+    for repo, path in nested:
+        nested_by_repo.setdefault(repo, []).append(path)
+
+    for mod in modules:
         tags = latest_tags(mod)
         if not tags:
             continue
         latest, prior = tags[0], tags[1] if len(tags) > 1 else ""
+        parent_layer = LAYER_BY_MODULE.get(mod) or (by_title.get(mod) or {}).get("fv", {}).get("Layer")
         upsert(mod, latest, prior, parent="", layer=LAYER_BY_MODULE.get(mod))
 
         # 嵌套模块独立成行（Layer 继承主模块）
-        parent_layer = (by_title.get(mod) or {}).get("fv", {}).get("Layer")
-        for path, vers in sorted(nested_tags(mod).items()):
+        paths = nested_by_repo.get(mod, [])
+        if not paths:
+            continue
+        nt = nested_tags(mod)
+        for path in paths:
+            vers = nt.get(path, [])
             ntitle = f"{mod}/{path}"
-            n_latest = vers[0] if vers else ""
-            n_prior = vers[1] if len(vers) > 1 else ""
-            upsert(ntitle, n_latest, n_prior, parent=mod, layer=parent_layer)
+            upsert(
+                ntitle,
+                vers[0] if vers else "",
+                vers[1] if len(vers) > 1 else "",
+                parent=mod,
+                layer=parent_layer,
+            )
+
+    # ---- 陈旧行清理 ----
+    # 判定：行标题不在真相源里 **且** 对应的仓/目录在 GitHub 上确实不存在。
+    # 两个条件缺一不可——矩阵外的单元（伞仓 oekit / matrix-tools / .github 等）
+    # 在 GitHub 上是存在的 ⇒ 一律不动，避免误删人工加的行。
+    expected_titles = set(modules) | {f"{repo}/{path}" for repo, path in nested}
+    for title in sorted(set(by_title) - expected_titles):
+        if module_exists(title):
+            continue
+        item = by_title[title]
+        print(f"  - {title}（矩阵真源已无此模块，仓/目录也已不存在）")
+        updates += 1
+        if apply:
+            delete_item(proj["id"], item["id"])
 
     if not updates:
         print("  all up to date")
@@ -825,7 +1007,9 @@ def sync_health_board(apply: bool) -> None:
 
     by_title = {it["title"]: it for it in proj["items"] if it["title"]}
     updates = 0
-    for mod in MODULES:
+    modules, _nested, src = load_truth()
+    print(f"  真相源：{src}（{len(modules)} 主模块）")
+    for mod in modules:
         item = by_title.get(mod)
         if not item:
             print(f"  + create row {mod}")
@@ -949,8 +1133,9 @@ def refresh_module(mod: str) -> None:
     不在 MODULES 里的仓（.github / matrix-tools 等治理仓）只吃 issue/PR 入板，不建版本行。
     """
     print(f"\n=== refresh {mod} ===")
-    if mod not in MODULES:
-        print(f"  skip (不在矩阵 MODULES): {mod}")
+    modules, nested_truth, src = load_truth()
+    if mod not in modules:
+        print(f"  skip (不在矩阵 MODULES: {src})")
         return
     root = latest_tags(mod)
     nested = nested_tags(mod)
@@ -987,19 +1172,29 @@ def refresh_module(mod: str) -> None:
             return
         cur_l = item["fv"].get("Latest")
         cur_p = item["fv"].get("Prior")
-        if cur_l == latest and (not prior or cur_p == prior):
+        cur_layer = item["fv"].get("Layer")
+        need = cur_l != latest or (bool(prior) and cur_p != prior)
+        if layer_id and layer and layer in layer_opts and (cur_layer or "") != layer:
+            need = True
+        if not need:
             return
         print(f"  ~ version {title}: {cur_l}/{cur_p} → {latest}/{prior or '-'}")
         if latest:
             set_field(proj["id"], item["id"], latest_id, text=latest)
         if prior:
             set_field(proj["id"], item["id"], prior_id, text=prior)
+        if layer_id and layer and layer in layer_opts and (cur_layer or "") != layer:
+            set_field(proj["id"], item["id"], layer_id, option_id=layer_opts[layer])
 
     if root:
         latest, prior = root[0], root[1] if len(root) > 1 else ""
         upsert_version(mod, latest, prior, parent="", layer=LAYER_BY_MODULE.get(mod))
-        parent_layer = (by_title.get(mod) or {}).get("fv", {}).get("Layer")
-        for path, vers in sorted(nested.items()):
+        parent_layer = LAYER_BY_MODULE.get(mod) or (by_title.get(mod) or {}).get("fv", {}).get("Layer")
+        # 嵌套行按**真相源**列（不是扫 tag 发现的）：矩阵删掉的嵌套模块不该被复活
+        for repo, path in nested_truth:
+            if repo != mod:
+                continue
+            vers = nested.get(path, [])
             upsert_version(
                 f"{mod}/{path}",
                 vers[0] if vers else "",
@@ -1047,6 +1242,66 @@ def refresh_module(mod: str) -> None:
 # ---------------------------------------------------------------------------
 
 
+def selftest() -> int:
+    """离线自测：嵌套 tag 解析 / 真相源装载 / Layer 覆盖 / 副本是否漂移。
+
+    纯静态断言，**不触网**（CI 里没有 gh 凭证也能跑）。
+    判据失效必须红——否则这道门禁只是摆设（与 board_query.py --selftest 同思路）。
+
+    这里红起来最有价值的一条是「内嵌副本 vs 真相源」：2026-10-25 之前，
+    手抄清单与 matrix.py 漂移（21 vs 24）却没有任何门禁会报，
+    代价是版本大盘长期缺 3 行主模块 + 1 行嵌套模块。
+    """
+    fails: list[str] = []
+
+    # 1) 嵌套 tag 解析：多层路径必须完整保留
+    cases = [
+        ("hlog/v0.1.4", ("hlog", "v0.1.4")),
+        (
+            "observability/tracing/instrumentation/kitexotel/v0.1.0",
+            ("observability/tracing/instrumentation/kitexotel", "v0.1.0"),
+        ),
+        ("v0.26.0", None),            # 根 tag 不是嵌套 tag
+        ("hlog/notaversion", None),   # 版本号不合规
+    ]
+    for tag, want in cases:
+        got = parse_nested_tag(tag)
+        if got != want:
+            fails.append(f"parse_nested_tag({tag!r}) = {got!r}，期望 {want!r}")
+
+    # 2) 真相源装载 + Layer 覆盖
+    modules, nested, src = load_truth()
+    if not modules:
+        fails.append("真相源模块清单为空")
+    for m in modules:
+        if m not in LAYER_BY_MODULE:
+            fails.append(f"模块 {m} 缺 Layer 归属（建行会没有层位）")
+    for extra in LAYER_BY_MODULE:
+        if extra not in modules:
+            fails.append(f"Layer 表里的 {extra} 不在模块清单里")
+    for repo, path in nested:
+        if not path or path.startswith("/") or path.endswith("/") or "//" in path:
+            fails.append(f"嵌套项 {repo}/{path} 的仓内路径不合法")
+        if repo not in modules:
+            fails.append(f"嵌套项 {repo}/{path} 的父仓不在模块清单里")
+
+    # 3) 副本与真相源一致（漂移即红——本次修复的核心不变量）
+    if modules != list(_FALLBACK_MODULES) or nested != list(_FALLBACK_NESTED):
+        fails.append(
+            f"内嵌副本与真相源 {src} 漂移"
+            f"（副本 {len(_FALLBACK_MODULES)} 主/{len(_FALLBACK_NESTED)} 嵌套，"
+            f"真相源 {len(modules)} 主/{len(nested)} 嵌套）——"
+            "请把 _FALLBACK_MODULES / _FALLBACK_NESTED 更新到一致"
+        )
+
+    for f in fails:
+        print(f"FAIL {f}")
+    if fails:
+        return 1
+    print(f"selftest OK（真相源 {src}：{len(modules)} 主模块 / {len(nested)} 嵌套模块）")
+    return 0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--apply", action="store_true")
@@ -1058,7 +1313,15 @@ def main() -> int:
         metavar="NAME",
         help="事件驱动：刷新单模块的版本矩阵 + 矩阵健康（tag/README 变更后）",
     )
+    ap.add_argument(
+        "--selftest",
+        action="store_true",
+        help="离线自测：嵌套 tag 解析 / 真相源装载 / Layer 覆盖（不触网）",
+    )
     args = ap.parse_args()
+
+    if args.selftest:
+        return selftest()
 
     # 凭证前置检查——**所有**模式都要过这一关（连 dry-run 也会调 API）。
     # 放在最前面是有意的：没有凭证时任何一步都会以 exit 4 崩在 gh 的调用上，
