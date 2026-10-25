@@ -1005,7 +1005,14 @@ def sync_version_board(apply: bool) -> None:
 
     updates = 0
 
-    def upsert(title: str, latest: str, prior: str, parent: str, layer: str | None) -> None:
+    def upsert(
+        title: str,
+        latest: str,
+        prior: str,
+        parent: str,
+        layer: str | None,
+        order: float | None = None,
+    ) -> None:
         nonlocal updates
         item = by_title.get(title)
         if not item:
@@ -1024,12 +1031,15 @@ def sync_version_board(apply: bool) -> None:
                 set_field(proj["id"], iid, latest_id, text=latest)
             if prior:
                 set_field(proj["id"], iid, prior_id, text=prior)
+            if order is not None and order_id:
+                set_field(proj["id"], iid, order_id, number=order)
             return
 
         cur_l = item["fv"].get("Latest")
         cur_p = item["fv"].get("Prior")
         cur_parent = item["fv"].get("Parent")
         cur_layer = item["fv"].get("Layer")
+        cur_order = item["fv"].get("序号")
         need = False
         if cur_l != latest or (prior and cur_p != prior):
             need = True
@@ -1038,6 +1048,14 @@ def sync_version_board(apply: bool) -> None:
         # 层位也要能刷新：原来只更 Latest/Prior，层位改了永远刷不上
         if layer_id and layer and layer in layer_opts and (cur_layer or "") != layer:
             need = True
+        # 序号（依赖位次）也要能刷新：新增/重排模块后位次会变
+        if order is not None and order_id:
+            try:
+                cur_order_n = float(cur_order) if cur_order is not None else None
+            except (TypeError, ValueError):
+                cur_order_n = None
+            if cur_order_n != order:
+                need = True
         if not need:
             return
         print(f"  ~ {title}: {cur_l}/{cur_p} → {latest}/{prior or '-'}  parent={parent or '-'}")
@@ -1052,25 +1070,45 @@ def sync_version_board(apply: bool) -> None:
             set_field(proj["id"], item["id"], parent_id, text=parent or "")
         if layer_id and layer and layer in layer_opts and (cur_layer or "") != layer:
             set_field(proj["id"], item["id"], layer_id, option_id=layer_opts[layer])
+        if order is not None and order_id:
+            try:
+                cur_order_n = float(cur_order) if cur_order is not None else None
+            except (TypeError, ValueError):
+                cur_order_n = None
+            if cur_order_n != order:
+                set_field(proj["id"], item["id"], order_id, number=order)
 
     nested_by_repo: dict[str, list[str]] = {}
     for repo, path in nested:
         nested_by_repo.setdefault(repo, []).append(path)
 
-    for mod in modules:
+    # 「序号」= 依赖自底向上的位次（主模块 ×10，嵌套模块跟在父级后 1..9）。
+    # 为什么要有这个字段：Projects 的**行序不是创建序**——删行+重建后位置会乱，
+    # 新模块也只能追加到末尾（这正是 kitx/etcdx/k8s 当初排在板子末尾的原因）。
+    # ⇒ 用一个数值字段承载位次，再在视图里按它排序，顺序才既正确又能长期自愈。
+    order_id = proj["fields"].get("序号", {}).get("id")
+
+    for mod_idx, mod in enumerate(modules):
         tags = latest_tags(mod)
         if not tags:
             continue
         latest, prior = tags[0], tags[1] if len(tags) > 1 else ""
         parent_layer = LAYER_BY_MODULE.get(mod) or (by_title.get(mod) or {}).get("fv", {}).get("Layer")
-        upsert(mod, latest, prior, parent="", layer=LAYER_BY_MODULE.get(mod))
+        upsert(
+            mod,
+            latest,
+            prior,
+            parent="",
+            layer=LAYER_BY_MODULE.get(mod),
+            order=float(mod_idx * 10),
+        )
 
         # 嵌套模块独立成行（Layer 继承主模块）
         paths = nested_by_repo.get(mod, [])
         if not paths:
             continue
         nt = nested_tags(mod)
-        for path in paths:
+        for j, path in enumerate(paths):
             vers = nt.get(path, [])
             ntitle = f"{mod}/{path}"
             upsert(
@@ -1079,6 +1117,7 @@ def sync_version_board(apply: bool) -> None:
                 vers[1] if len(vers) > 1 else "",
                 parent=mod,
                 layer=parent_layer,
+                order=float(mod_idx * 10 + j + 1),
             )
 
     # ---- 陈旧行清理 ----
@@ -1255,13 +1294,21 @@ def refresh_module(mod: str) -> None:
     parent_id = proj["fields"].get("Parent", {}).get("id")
     layer_id = proj["fields"].get("Layer", {}).get("id")
     layer_opts = opt_map(proj["fields"].get("Layer"))
+    order_id = proj["fields"].get("序号", {}).get("id")
     by_title = {
         (it["title"] or "").split("@")[0].strip(): it
         for it in proj["items"]
         if it["title"]
     }
 
-    def upsert_version(title: str, latest: str, prior: str, parent: str, layer: str | None) -> None:
+    def upsert_version(
+        title: str,
+        latest: str,
+        prior: str,
+        parent: str,
+        layer: str | None,
+        order: float | None = None,
+    ) -> None:
         item = by_title.get(title)
         if not item:
             print(f"  + version {title}  {latest}/{prior or '-'}")
@@ -1276,13 +1323,24 @@ def refresh_module(mod: str) -> None:
                 set_field(proj["id"], iid, latest_id, text=latest)
             if prior:
                 set_field(proj["id"], iid, prior_id, text=prior)
+            if order is not None and order_id:
+                set_field(proj["id"], iid, order_id, number=order)
             return
         cur_l = item["fv"].get("Latest")
         cur_p = item["fv"].get("Prior")
         cur_layer = item["fv"].get("Layer")
+        cur_order = item["fv"].get("序号")
         need = cur_l != latest or (bool(prior) and cur_p != prior)
         if layer_id and layer and layer in layer_opts and (cur_layer or "") != layer:
             need = True
+        order_n = None
+        if order is not None and order_id:
+            try:
+                order_n = float(cur_order) if cur_order is not None else None
+            except (TypeError, ValueError):
+                order_n = None
+            if order_n != order:
+                need = True
         if not need:
             return
         print(f"  ~ version {title}: {cur_l}/{cur_p} → {latest}/{prior or '-'}")
@@ -1292,15 +1350,24 @@ def refresh_module(mod: str) -> None:
             set_field(proj["id"], item["id"], prior_id, text=prior)
         if layer_id and layer and layer in layer_opts and (cur_layer or "") != layer:
             set_field(proj["id"], item["id"], layer_id, option_id=layer_opts[layer])
+        if order is not None and order_id and order_n != order:
+            set_field(proj["id"], item["id"], order_id, number=order)
 
     if root:
+        mod_idx = modules.index(mod) if mod in modules else 0
         latest, prior = root[0], root[1] if len(root) > 1 else ""
-        upsert_version(mod, latest, prior, parent="", layer=LAYER_BY_MODULE.get(mod))
+        upsert_version(
+            mod,
+            latest,
+            prior,
+            parent="",
+            layer=LAYER_BY_MODULE.get(mod),
+            order=float(mod_idx * 10),
+        )
         parent_layer = LAYER_BY_MODULE.get(mod) or (by_title.get(mod) or {}).get("fv", {}).get("Layer")
         # 嵌套行按**真相源**列（不是扫 tag 发现的）：矩阵删掉的嵌套模块不该被复活
-        for repo, path in nested_truth:
-            if repo != mod:
-                continue
+        nested_paths = [p for r, p in nested_truth if r == mod]
+        for j, path in enumerate(nested_paths):
             vers = nested.get(path, [])
             upsert_version(
                 f"{mod}/{path}",
@@ -1308,6 +1375,7 @@ def refresh_module(mod: str) -> None:
                 vers[1] if len(vers) > 1 else "",
                 parent=mod,
                 layer=parent_layer,
+                order=float(mod_idx * 10 + j + 1),
             )
 
     # tag 推送 = 一次「近期变更」⇒ 顺手把窗口滚到包含今天
