@@ -1358,16 +1358,24 @@ def _write_view_filter(view_id: str, want: str) -> None:
 
 
 def add_draft(pid: str, title: str, body: str = "") -> str:
-    esc_t = title.replace("\\", "\\\\").replace('"', '\\"')
-    esc_b = body.replace("\\", "\\\\").replace('"', '\\"')
+    """建一行草稿（看板里的手工行）。
+
+    正文与标题走 **GraphQL 变量**：GraphQL 的字符串字面量里不能有裸换行，
+    拼进 query 字符串会让整个 mutation 变成 "Expected string or block string,
+    but it was malformed" ⇒ 草稿行**建不出来**（2026-10-25 实测：
+    #4 的行序重建跑完后，手工行没回来；根因就是这里没转义换行）。
+    """
     data = gql(
-        f"""
-        mutation {{
-          addProjectV2DraftIssue(input: {{
-            projectId: "{pid}", title: "{esc_t}", body: "{esc_b}"
-          }}) {{ projectItem {{ id }} }}
-        }}
         """
+        mutation($title: String!, $body: String) {
+          addProjectV2DraftIssue(input: {
+            projectId: "%s", title: $title, body: $body
+          }) { projectItem { id } }
+        }
+        """
+        % pid,
+        title=title,
+        body=body or "",
     )
     return data["addProjectV2DraftIssue"]["projectItem"]["id"]
 
@@ -1994,7 +2002,22 @@ def selftest() -> int:
     return 0
 
 
+def _enable_line_buffering() -> None:
+    """让 stdout 行缓冲。
+
+    2026-10-25 实测：#4 的行序重建跑到一半被整点同步 cancel 时，
+    **CI 日志里只剩第一行**（进程被杀 ⇒ 块缓冲的 stdout 没落盘），
+    现场完全看不到「删到第几行、重建到第几行」。
+    行缓冲后每个 print 立刻落盘 ⇒ 被 kill 也留得下已经发生的部分。
+    """
+    try:
+        sys.stdout.reconfigure(line_buffering=True)
+    except Exception:
+        pass  # stdout 不是 TextIOWrapper（例如被重定向成别的流）时忽略
+
+
 def main() -> int:
+    _enable_line_buffering()
     ap = argparse.ArgumentParser()
     ap.add_argument("--apply", action="store_true")
     ap.add_argument("--only", type=int, choices=[1, 2, 3, 4], help="只跑某块大盘")
