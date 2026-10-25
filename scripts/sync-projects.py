@@ -777,35 +777,116 @@ def infer_module(repo, title: str) -> str | None:
     return "meta"
 
 
-def list_org_issues() -> list[dict]:
-    issues: list[dict] = []
-    seen: set[str] = set()
-    for state in ("open", "closed"):
-        raw = subprocess.check_output(
-            [
-                "gh", "search", "issues",
-                "--owner", ORG,
-                "--state", state,
-                # 必须留足余量：org issue 超过后 search 静默截断，板上会缺行
-                "--limit", "1000",
-                # 按创建时间倒序：板子的行序 = 入板顺序 ⇒ 新进的 issue 必须排在最前，
-                # 否则板上永远是「最早入板的那批」在最上面（2026-10-25 实测：
-                # 总览第一屏全是两年前的旧 issue，新的全堆在末尾）
-                "--sort", "created",
-                "--order", "desc",
-                "--json", "repository,title,number,url,state,createdAt",
-            ],
-            text=True,
+def org_repos() -> list[str]:
+    """org 下的全部仓（full_name 列表）。
+
+    用于「按仓枚举」——`gh search` 有 **1000 条硬上限**，org 级搜索一旦超过
+    就会静默截断 ⇒ 只能拆成按仓搜（单仓远不到 1000 条）。
+    """
+    raw = subprocess.check_output(
+        ["gh", "api", "--paginate", f"/orgs/{ORG}/repos?per_page=100", "--jq", ".[].full_name"],
+        text=True,
+    )
+    return [line.strip() for line in raw.splitlines() if line.strip()]
+
+
+def _search_paged(kind: str, repo: str | None, state: str) -> list[dict]:
+    """按 state 搜 issue/PR；repo=None 表示整个 org。
+
+    按 createdAt 倒序返回（板子的行序 = 建行顺序 ⇒ 新的必须排在最前）。
+    """
+    argv = [
+        "gh", "search", kind,
+        "--state", state,
+        "--limit", "1000",
+        "--sort", "created",
+        "--order", "desc",
+        "--json", "repository,title,number,url,state,createdAt",
+    ]
+    if repo:
+        argv += ["--repo", repo]
+    else:
+        argv += ["--owner", ORG]
+    batch = json.loads(subprocess.check_output(argv, text=True))
+    if len(batch) >= 1000:
+        print(
+            f"  ! search {kind} {repo or ORG} state={state} 命中 1000 上限，可能被截断",
+            file=sys.stderr,
         )
-        batch = json.loads(raw)
-        if len(batch) >= 1000:
-            print(f"  ! search issues state={state} hit limit 1000，可能被截断", file=sys.stderr)
+    return batch
+
+
+def _list_repo_items(kind: str, repo: str) -> list[dict]:
+    """按仓列 issue/PR（`gh pr/issue list` 走 GraphQL，不受 search 的 30 次/分限额）。
+
+    顺序：**merged 先查** —— closed 里也含 merged，先查 merged 才保得住 MERGED 状态
+    （否则合入过的 PR 会被标成「已关闭」）。
+
+    补 repository 字段：`gh search` 的返回里有，`gh pr list` 没有 ⇒
+    infer_module() 靠它推 Module 列，缺了会全落 meta。
+    """
+    is_pr = kind == "prs"
+    _, _, name = repo.partition("/")
+    states = ("open", "merged", "closed") if is_pr else ("open", "closed")
+    out: list[dict] = []
+    for st in states:
+        cmd = [
+            "gh", "pr" if is_pr else "issue", "list",
+            "--repo", repo,
+            "--state", st,
+            "--limit", "1000",
+            "--json", "number,title,url,createdAt,state",
+        ]
+        try:
+            out += json.loads(subprocess.check_output(cmd, text=True))
+        except Exception as exc:
+            print(f"  ! 列 {repo} 的 {kind} 失败：{str(exc)[:200]}", file=sys.stderr)
+    for i in out:
+        i["repository"] = {"nameWithOwner": repo, "name": name}
+    return out
+
+
+def _list_org_all(kind: str, skip_pull: bool) -> list[dict]:
+    """org 侧的 issue/PR 全集。
+
+    org 级搜索命中 1000 上限时**自动降级为按仓枚举**：
+    截断的形态是「最老的那批永远查不到」⇒ 板上永远缺行
+    （2026-10-25 实测：#4 的 PR 队列重建后少了 108 行——search 只给出最新的 1000 条）。
+    """
+    out: list[dict] = []
+    seen: set[str] = set()
+
+    def collect(batch: list[dict]) -> None:
         for i in batch:
-            if i["url"] in seen or "/pull/" in i["url"]:
+            if i["url"] in seen:
+                continue
+            if skip_pull and "/pull/" in i["url"]:
                 continue
             seen.add(i["url"])
-            issues.append(i)
-    return issues
+            out.append(i)
+
+    hit = False
+    for state in ("open", "closed"):
+        batch = _search_paged(kind, None, state)
+        collect(batch)
+        if len(batch) >= 1000:
+            hit = True
+    if not hit:
+        out.sort(key=lambda i: i.get("createdAt") or "", reverse=True)
+        return out
+
+    print(f"  · {kind} 命中搜索上限 ⇒ 改为按仓枚举取全集", file=sys.stderr)
+    out.clear()
+    seen.clear()
+    for repo in org_repos():
+        collect(_list_repo_items(kind, repo))
+    out.sort(key=lambda i: i.get("createdAt") or "", reverse=True)
+    return out
+
+
+def list_org_issues() -> list[dict]:
+    """org 的全部 issue（不含 PR）。"""
+    return _list_org_all("issues", skip_pull=True)
 
 
 def sync_issue_board(apply: bool, force_reorder: bool = False) -> None:
@@ -1011,32 +1092,8 @@ def want_review(pr_state: str, cur: str | None) -> str:
 
 
 def list_org_prs() -> list[dict]:
-    prs: list[dict] = []
-    seen: set[str] = set()
-    for state in ("open", "closed"):
-        raw = subprocess.check_output(
-            [
-                "gh", "search", "prs",
-                "--owner", ORG,
-                "--state", state,
-                # 曾用 50 导致 closed PR 被截断（实际 65+），15 条进不了板
-                "--limit", "1000",
-                # 按创建时间倒序：板子的行序 = 入板顺序 ⇒ 新进的 PR 排在最前
-                "--sort", "created",
-                "--order", "desc",
-                "--json", "repository,title,number,url,state,createdAt",
-            ],
-            text=True,
-        )
-        batch = json.loads(raw)
-        if len(batch) >= 1000:
-            print(f"  ! search prs state={state} hit limit 1000，可能被截断", file=sys.stderr)
-        for i in batch:
-            if i["url"] in seen:
-                continue
-            seen.add(i["url"])
-            prs.append(i)
-    return prs
+    """org 自家仓的全部 PR（跨仓 PR 不在其中，靠事件驱动的 --link 入板）。"""
+    return _list_org_all("prs", skip_pull=False)
 
 
 def sync_pr_board(apply: bool, force_reorder: bool = False) -> None:
