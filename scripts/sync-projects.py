@@ -400,14 +400,19 @@ def list_org_issues() -> list[dict]:
                 "--owner", ORG,
                 "--state", state,
                 # 必须留足余量：org issue 超过后 search 静默截断，板上会缺行
-                "--limit", "200",
+                "--limit", "1000",
+                # 按创建时间倒序：板子的行序 = 入板顺序 ⇒ 新进的 issue 必须排在最前，
+                # 否则板上永远是「最早入板的那批」在最上面（2026-10-25 实测：
+                # 总览第一屏全是两年前的旧 issue，新的全堆在末尾）
+                "--sort", "created",
+                "--order", "desc",
                 "--json", "repository,title,number,url,state",
             ],
             text=True,
         )
         batch = json.loads(raw)
-        if len(batch) >= 200:
-            print(f"  ! search issues state={state} hit limit 200，可能被截断", file=sys.stderr)
+        if len(batch) >= 1000:
+            print(f"  ! search issues state={state} hit limit 1000，可能被截断", file=sys.stderr)
         for i in batch:
             if i["url"] in seen or "/pull/" in i["url"]:
                 continue
@@ -571,14 +576,17 @@ def list_org_prs() -> list[dict]:
                 "--owner", ORG,
                 "--state", state,
                 # 曾用 50 导致 closed PR 被截断（实际 65+），15 条进不了板
-                "--limit", "200",
+                "--limit", "1000",
+                # 按创建时间倒序：板子的行序 = 入板顺序 ⇒ 新进的 PR 排在最前
+                "--sort", "created",
+                "--order", "desc",
                 "--json", "repository,title,number,url,state",
             ],
             text=True,
         )
         batch = json.loads(raw)
-        if len(batch) >= 200:
-            print(f"  ! search prs state={state} hit limit 200，可能被截断", file=sys.stderr)
+        if len(batch) >= 1000:
+            print(f"  ! search prs state={state} hit limit 1000，可能被截断", file=sys.stderr)
         for i in batch:
             if i["url"] in seen:
                 continue
