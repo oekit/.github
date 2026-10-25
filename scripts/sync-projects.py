@@ -1141,7 +1141,7 @@ def sync_version_board(apply: bool) -> None:
 
 
 def sync_health_board(apply: bool) -> None:
-    """矩阵健康：Install/Tag 并排对照 + Note 诊断 + Hygiene/Drift 汇总。"""
+    """矩阵健康：Install/Tag 并排对照 + Note 诊断 + Hygiene/Drift 汇总 + 依赖位次。"""
     print("\n=== #3 矩阵健康 ===")
     proj = load_project(PROJECT_HEALTH)
     hy_opts = opt_map(proj["fields"].get("Hygiene"))
@@ -1150,12 +1150,14 @@ def sync_health_board(apply: bool) -> None:
     install_id = proj["fields"].get("Install", {}).get("id")
     tag_id = proj["fields"].get("Tag", {}).get("id")
     note_id = proj["fields"].get("Note", {}).get("id")
+    # 「序号」= 依赖位次，与 #2 版本大盘同一口径（主模块 ×10）
+    order_id = proj["fields"].get("序号", {}).get("id")
 
     by_title = {it["title"]: it for it in proj["items"] if it["title"]}
     updates = 0
     modules, _nested, src = load_truth()
     print(f"  真相源：{src}（{len(modules)} 主模块）")
-    for mod in modules:
+    for mod_idx, mod in enumerate(modules):
         item = by_title.get(mod)
         if not item:
             print(f"  + create row {mod}")
@@ -1186,16 +1188,22 @@ def sync_health_board(apply: bool) -> None:
         cur_install = item["fv"].get("Install") or ""
         cur_tag = item["fv"].get("Tag") or ""
         cur_note = item["fv"].get("Note") or ""
+        cur_order = item["fv"].get("序号")
         try:
             cur_drift_n = float(cur_drift) if cur_drift is not None else None
         except (TypeError, ValueError):
             cur_drift_n = None
+        try:
+            cur_order_n = float(cur_order) if cur_order is not None else None
+        except (TypeError, ValueError):
+            cur_order_n = None
         if (
             cur != want
             or cur_drift_n != float(drift)
             or cur_install != install
             or cur_tag != latest
             or cur_note != note
+            or (order_id is not None and cur_order_n != float(mod_idx * 10))
         ):
             print(f"  ~ {mod}: {cur}/{cur_drift} → {want}/{drift}  install={install or '-'} tag={latest or '-'}")
             updates += 1
@@ -1210,6 +1218,23 @@ def sync_health_board(apply: bool) -> None:
                     set_field(proj["id"], item["id"], tag_id, text=latest)
                 if note_id is not None:
                     set_field(proj["id"], item["id"], note_id, text=note)
+                if order_id is not None and cur_order_n != float(mod_idx * 10):
+                    set_field(proj["id"], item["id"], order_id, number=float(mod_idx * 10))
+
+    # ---- 陈旧行清理（健康大盘是**模块口径**）----
+    # 为什么按模块口径清：这块板子的四个字段（Tag/Install/Drift/Hygiene）判的是
+    # 「README 安装行 == 最新 tag」，与 matrix-tools/scripts/audit.py 的安装行门禁
+    # **同一口径**（那边也是 `for repo in MODULES:`）。
+    # 伞仓 / 站点 / 治理仓（oekit / oekit.github.io / .github）不是矩阵模块，
+    # 对它们做不出这个判定，且脚本也不刷新它们 ⇒ 永远卡在「待审计 / 无 tag / 无安装行」
+    # ⇒ 只是噪音，还会把「待审计」视图刷成 3 条假待办 ⇒ 清掉。
+    for title in sorted(set(by_title) - set(modules)):
+        item = by_title[title]
+        print(f"  - {title}（非矩阵模块，健康大盘按模块口径）")
+        updates += 1
+        if apply:
+            delete_item(proj["id"], item["id"])
+
     if not updates:
         print("  all up to date")
     if not apply and updates:
