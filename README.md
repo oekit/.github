@@ -40,16 +40,22 @@ GitHub Projects **不会**自动纳入 issue/PR，也不会跟进 tag。本仓�
 
 同步规则：
 
-1. **Issue 大盘** — org issue 缺则入板；`state=open→Todo / closed→Done`；`Kind` 按标题打分推导（Bug/Enhancement/Refactor/Docs/Chore，**每次覆盖**，人工微调请用 Labels）；`Module`=所属仓
+1. **Issue 大盘** — org issue 缺则入板；`state=open→Todo / closed→Done`（人工标的 `In Progress` 不被冲掉）；`Kind` 按标题打分推导（Bug/Enhancement/Refactor/Docs/Chore，**每次覆盖**，人工微调请用 Labels）；`Module`=所属仓
    - **入板范围 = 全 org**：整点全量同步用 `gh search issues --owner oekit` 拉全量 issue，
      所以「某仓的 issue 进不进大盘」与下发无关；各仓的 `issue-to-project.yml`
      只决定**延迟**（秒级 vs ≤1 小时），下发范围 = 矩阵全部根模块 + 4 个 infra 仓；
    - **读路径以 issue 侧为准**：断言「某 issue 在不在看板上」读 `issue.projectItems`
      （`scripts/board_query.py`）——`projectV2.items` 分页**滞后**于 issue 侧，
      用分页判会把「已入板」误判成「不在板上」（假阴性，oekit/.github#24）。
+   - **行序 = createdAt 倒序（最新在最前）**：Projects 的行序是**行的创建序**，
+     公开 API 写不了视图排序、新行只能追加到末尾 ⇒ 想让新记录排在最前，
+     只能把行按规范序重建（全删 + 按序重加）。脚本会**检测漂移并自动重建**，
+     重建中断也不会丢数据（缺行由下一轮补回、漂移由下一轮再重建）。
 2. **版本大盘** — 主模块与嵌套模块独立成行（Title=`logx` / `logx/hlog`）；`Latest`/`Prior`=近两版 root tag；`Parent` 标嵌套归属；缺行自动补
 3. **矩阵健康** — `Install`/`Tag` 并排对照 + `Note` 诊断；`Hygiene`（全绿 / 有漂移 / 待审计）+ `Drift` 0/1
 4. **PR 审查队列** — org PR 缺则入队；`open→待审 / merged→已合入 / closed→已关闭`；`Scope` 按 conventional commit 类型（build/deps → deps）
+   - **Review 分权**：PR 落到终态（merged/closed）由脚本说了算；在途时
+     `审阅中 / 需修改 / 可合入` 是**人工流转态，脚本不冲掉**（只有还没人动过才落 `待审`）。
 
 ### 前置：`OEKIT_PROJECT_TOKEN`
 
@@ -71,7 +77,37 @@ gh auth refresh -s project
 | Issue 大盘 | 总览 · 开启(`status:Todo`) · 关闭(`status:Done`) · 看板 · 按模块 · 按类型 |
 | 版本大盘 | 总览 · 按层级(Board) · 嵌套模块(`Parent` 非空) · 近期变更 |
 | 矩阵健康 | 总览 · 有漂移 · 全绿 · 待审计 · 看板 |
-| PR 审查队列 | 总览 · 待审 · 审阅中 · 可合入 · 已合入 · 已关闭 · 按 Scope |
+| PR 审查队列 | 总览 · 待审 · 审阅中 · 可合入 · 已合入 · 已关闭 · 按 Scope · 看板 |
+
+规格明细（**分组 / 过滤器 / 可见列**，四块板统一口径）：
+
+| 大盘 | 视图 | 布局 | 分组 | 过滤器 | 可见列 |
+|---|---|---|---|---|---|
+| Issue | 总览 | 表格 | — | — | Title · Status · Kind · Module · Created |
+| Issue | 开启 | 表格 | — | `status:Todo` | Title · Kind · Module · Created |
+| Issue | 关闭 | 表格 | — | `status:Done` | Title · Kind · Module · Closed |
+| Issue | 看板 | 看板 | **Kind** | — | Title · Status · Kind · Module |
+| Issue | 按模块 | 表格 | **Module** | — | Title · Kind · Status · Created |
+| Issue | 按类型 | 表格 | **Kind** | — | Title · Module · Status · Created |
+| PR | 总览 | 表格 | — | — | Title · Review · Scope · Updated |
+| PR | 待审 | 表格 | — | `review:"待审"` | Title · Scope · Updated |
+| PR | 审阅中 | 表格 | — | `review:"审阅中"` | Title · Scope · Updated |
+| PR | 可合入 | 表格 | — | `review:"可合入"` | Title · Scope · Updated |
+| PR | 已合入 | 表格 | — | `review:"已合入"` | Title · Scope · Closed |
+| PR | 已关闭 | 表格 | — | `review:"已关闭"` | Title · Scope · Closed |
+| PR | 按 Scope | 表格 | **Scope** | — | Title · Review · Updated |
+| PR | 看板 | 看板 | **Review** | — | Title · Review · Scope |
+
+三条口径（改动时务必一起看）：
+
+- **过滤器与可见列 = 脚本钉死**：`scripts/sync-projects.py` 里的 `PINNED_VIEWS`
+  是唯一事实源，UI 上被人手改乱了会被下一轮同步改回来；`--selftest` 会校验这张表。
+- **分组 = 只能手点**：公开 GraphQL 的 `UpdateProjectV2ViewInput` 里**没有 groupBy 字段**
+  ⇒ 表格视图的 `Group by` / 看板视图的 `Column by` 只能进 UI 落盘
+  （面板改草稿 → 视图 kebab 菜单「Save changes to new view」→ 改名 → 删旧视图）。
+  期望值记在脚本的 `PINNED_GROUPS` 里，脚本只能声明、无法校验。
+- **排序 = 存不住**：视图的 `Sort by` 在新版 UI 里只落 URL 草稿，面板 Save view 也留不下
+  ⇒ 行序只能靠**建行顺序**保证（见上面同步规则里的「行序」一条）。
 
 ## 共享 workflow
 
@@ -179,6 +215,9 @@ jobs:
 - **升级 action 版本**：本仓 dependabot（`github-actions` ecosystem，weekly）提 PR，merge 即全 org 生效。
 - **改治理大盘联动**：issue/PR 模板与 CONTRIBUTING 里的 Projects 链接/字段名；项目号（1/4）是稳定 ID，换板才需要改。
 - **手动补同步**：`python3 scripts/sync-projects.py --apply`（或 Actions → 大盘同步 → Run workflow）。
+- **手动重排行序**：`python3 scripts/sync-projects.py --apply --reorder --only <1|4>`。
+  行序漂移时小板（≤500 行）会自动重建；大板（#4 PR 队列 1100+ 行，一次重建 ≈4400 次写）
+  只告警不自动烧配额，需要时用 `--reorder` 手工触发。
 - **同步未生效**：检查 `OEKIT_PROJECT_TOKEN` 是否过期 / 是否有 `project` scope。
 - **新增仓库**：拷上面的接入模板，改 `go-version` 即可；或跑
   `scripts/sync-callers.sh <repo-dir>` 从旧版完整 ci.yml 自动生成薄调用层

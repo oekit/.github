@@ -4,3 +4,7 @@
 __pycache__/
 *.pyc
 *.pyo
+
+# gh CLI 的本地状态目录（含 device-id 等本机标识）——本地运行 gh 时自动生成，
+# 与仓库内容无关，不跟踪。
+.local/
