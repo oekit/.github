@@ -361,6 +361,21 @@ def set_field_safe(pid: str, item_id: str, field_id: str, **kw) -> bool:
         return False
 
 
+def add_url_safe(pid: str, url: str) -> str | None:
+    """把一条 issue/PR 加进看板；失败返回 None（不抛错）。
+
+    为什么需要「安全版」：**行重建被打断**后，板上一部分行已经是新的，
+    下一轮同步再按快照把它们当「缺失」去加 ⇒ GitHub 回 "already added"
+    ⇒ 不容错的话整轮同步会被这一个错误打死（2026-10-25 实测：
+    #4 的行序重建被整点同步取消后，重建残留的行让下一轮同步连挂）。
+    """
+    try:
+        return add_url(pid, url)
+    except Exception as exc:
+        print(f"  ! 入板失败 {url}：{str(exc)[:200]}")
+        return None
+
+
 def add_url(pid: str, url: str) -> str:
     repo, num, kind = parse_github_url(url)
     node = subprocess.check_output(
@@ -732,7 +747,9 @@ def sync_issue_board(apply: bool, force_reorder: bool = False) -> None:
                 set_field_safe(proj["id"], iid, mod_id, option_id=mod_opts["meta"])
 
     for a in adds:
-        iid = add_url(proj["id"], a["url"])
+        iid = add_url_safe(proj["id"], a["url"])
+        if not iid:
+            continue
         assign(iid, a["want_status"], a["want_kind"], a["want_mod"])
     for s in syncs:
         assign(s["id"], s["status"], s["kind"], s["mod"])
@@ -938,7 +955,9 @@ def sync_pr_board(apply: bool, force_reorder: bool = False) -> None:
             set_field_safe(proj["id"], iid, scope_id, option_id=scope_opts[scope])
 
     for a in adds:
-        iid = add_url(proj["id"], a["url"])
+        iid = add_url_safe(proj["id"], a["url"])
+        if not iid:
+            continue
         assign(iid, a["want_review"], a["want_scope"])
     for s in syncs:
         assign(s["id"], s["review"], s["scope"])
