@@ -62,8 +62,9 @@ PINNED_VIEWS: dict[int, dict[str, dict]] = {
         "开启": {"filter": "status:Todo", "columns": ["Title", "Kind", "Module", "Created"]},
         "关闭": {"filter": "status:Done", "columns": ["Title", "Kind", "Module", "Closed"]},
         "看板": {"filter": "", "columns": ["Title", "Status", "Kind", "Module"]},
-        "按模块": {"filter": "", "columns": ["Title", "Kind", "Status", "Created"]},
-        "按类型": {"filter": "", "columns": ["Title", "Module", "Status", "Created"]},
+        # 分组视图必须**看得见分组列**（按模块就要有 Module，按类型就要有 Kind）
+        "按模块": {"filter": "", "columns": ["Title", "Module", "Status", "Created"]},
+        "按类型": {"filter": "", "columns": ["Title", "Kind", "Module", "Created"]},
     },
     PROJECT_PR: {
         "总览": {"filter": "", "columns": ["Title", "Review", "Scope", "Updated"]},
@@ -72,7 +73,7 @@ PINNED_VIEWS: dict[int, dict[str, dict]] = {
         "可合入": {"filter": 'review:"可合入"', "columns": ["Title", "Scope", "Updated"]},
         "已合入": {"filter": 'review:"已合入"', "columns": ["Title", "Scope", "Closed"]},
         "已关闭": {"filter": 'review:"已关闭"', "columns": ["Title", "Scope", "Closed"]},
-        "按 Scope": {"filter": "", "columns": ["Title", "Review", "Updated"]},
+        "按 Scope": {"filter": "", "columns": ["Title", "Scope", "Review", "Updated"]},
         "看板": {"filter": "", "columns": ["Title", "Review", "Scope"]},
     },
 }
@@ -343,6 +344,23 @@ def set_field(pid: str, item_id: str, field_id: str, *, option_id: str | None = 
     )
 
 
+def set_field_safe(pid: str, item_id: str, field_id: str, **kw) -> bool:
+    """写字段，失败只告警不抛错。
+
+    为什么需要「安全版」：**并发重建**时另一轮同步可能正在处理同一批行，
+    其中一部分已经被删掉（行重建 = 全删 + 按序重加）⇒ 写字段会 404。
+    这种竞态不该把整轮同步打成红；写漏的字段下一轮会被 diff 出来补上（自愈）。
+
+    返回 True=写成功 / False=失败（调用方可统计）。
+    """
+    try:
+        set_field(pid, item_id, field_id, **kw)
+        return True
+    except Exception as exc:
+        print(f"  ! 写字段失败（item {item_id}）：{str(exc)[:200]}")
+        return False
+
+
 def add_url(pid: str, url: str) -> str:
     repo, num, kind = parse_github_url(url)
     node = subprocess.check_output(
@@ -489,7 +507,7 @@ def rebuild_rows(pid: str, board_items: list[dict], plan: list[dict]) -> tuple[i
             print(f"  ! 重建跳过 {row.get('url') or row.get('title')}：{exc}")
             continue
         for fid, oid in row["fields"]:
-            set_field(pid, iid, fid, option_id=oid)
+            set_field_safe(pid, iid, fid, option_id=oid)
         ok += 1
     return ok, skipped
 
@@ -703,15 +721,15 @@ def sync_issue_board(apply: bool, force_reorder: bool = False) -> None:
 
     def assign(iid: str, status: str, kind: str | None, mod: str | None) -> None:
         if status in status_opts:
-            set_field(proj["id"], iid, status_id, option_id=status_opts[status])
+            set_field_safe(proj["id"], iid, status_id, option_id=status_opts[status])
         if kind and kind in kind_opts and kind_id:
-            set_field(proj["id"], iid, kind_id, option_id=kind_opts[kind])
+            set_field_safe(proj["id"], iid, kind_id, option_id=kind_opts[kind])
         if mod and mod in mod_opts and mod_id:
-            set_field(proj["id"], iid, mod_id, option_id=mod_opts[mod])
+            set_field_safe(proj["id"], iid, mod_id, option_id=mod_opts[mod])
         elif mod and mod_id:
             # 模板里没有的模块名，落 meta，避免整列空着
             if "meta" in mod_opts:
-                set_field(proj["id"], iid, mod_id, option_id=mod_opts["meta"])
+                set_field_safe(proj["id"], iid, mod_id, option_id=mod_opts["meta"])
 
     for a in adds:
         iid = add_url(proj["id"], a["url"])
@@ -915,9 +933,9 @@ def sync_pr_board(apply: bool, force_reorder: bool = False) -> None:
 
     def assign(iid: str, review: str, scope: str | None) -> None:
         if review in review_opts:
-            set_field(proj["id"], iid, review_id, option_id=review_opts[review])
+            set_field_safe(proj["id"], iid, review_id, option_id=review_opts[review])
         if scope and scope in scope_opts and scope_id:
-            set_field(proj["id"], iid, scope_id, option_id=scope_opts[scope])
+            set_field_safe(proj["id"], iid, scope_id, option_id=scope_opts[scope])
 
     for a in adds:
         iid = add_url(proj["id"], a["url"])
@@ -1253,7 +1271,11 @@ def sync_pinned_view_configs(apply: bool) -> None:
             if want_cols:
                 want_ids = [fields[c]["id"] for c in want_cols if c in fields]
                 cur_ids = [fields[c]["id"] for c in v["columns"] if c in fields]
-                if cur_ids != want_ids:
+                # 比**集合**而不是序列：实测 visibleFieldIds 写进去的顺序会被 GitHub
+                # 按「项目字段顺序」归一（写 [Kind,Title,Module,Status,Created] 读回来
+                # 仍是 Title|Status|Created|Kind|Module）⇒ 按序列比对会导致每轮同步
+                # 都判定「列不一样」而重写（噪音，且会冲掉 UI 里拖出来的列序）。
+                if sorted(cur_ids) != sorted(want_ids):
                     print(f"  ~ #{number} {name} 列：{v['columns']} → {want_cols}")
                     if apply:
                         _write_view_columns(v["id"], want_ids)
@@ -1293,16 +1315,24 @@ def check_pinned_groups(apply: bool = False) -> None:
 
 
 def _write_view_filter(view_id: str, want: str) -> None:
-    """写视图过滤器；失败只告警不抛错（视图配置挂了不该拖垮看板同步）。"""
+    """写视图过滤器；失败只告警不抛错（视图配置挂了不该拖垮看板同步）。
+
+    过滤器值里**可能带双引号**（单选字段的 DSL 就是 `review:"待审"` 这种写法）
+    ⇒ 必须走 **GraphQL 变量**，把值拼进 query 字符串会打成非法语法：
+    实测 2026-10-25，#4 的「可合入 / 已关闭」两个视图的过滤器就是这么写失败的
+    （报错被截断成 "写视图过滤器失败"，差点被当成配额问题）。
+    """
     try:
         gql(
-            f"""
-            mutation {{
-              updateProjectV2View(input: {{
-                viewId: "{view_id}", filter: "{want}"
-              }}) {{ projectV2View {{ id name filter }} }}
-            }}
             """
+            mutation($filter: String!) {
+              updateProjectV2View(input: {
+                viewId: "%s", filter: $filter
+              }) { projectV2View { id name filter } }
+            }
+            """
+            % view_id,
+            filter=want,
         )
     except Exception as exc:
         print(f"  ! 写视图过滤器失败（{exc}）——看板数据不受影响，继续")

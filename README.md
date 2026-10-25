@@ -87,27 +87,36 @@ gh auth refresh -s project
 | Issue | 开启 | 表格 | — | `status:Todo` | Title · Kind · Module · Created |
 | Issue | 关闭 | 表格 | — | `status:Done` | Title · Kind · Module · Closed |
 | Issue | 看板 | 看板 | **Kind** | — | Title · Status · Kind · Module |
-| Issue | 按模块 | 表格 | **Module** | — | Title · Kind · Status · Created |
-| Issue | 按类型 | 表格 | **Kind** | — | Title · Module · Status · Created |
+| Issue | 按模块 | 表格 | **Module** | — | Title · Module · Status · Created |
+| Issue | 按类型 | 表格 | **Kind** | — | Title · Kind · Module · Created |
 | PR | 总览 | 表格 | — | — | Title · Review · Scope · Updated |
 | PR | 待审 | 表格 | — | `review:"待审"` | Title · Scope · Updated |
 | PR | 审阅中 | 表格 | — | `review:"审阅中"` | Title · Scope · Updated |
 | PR | 可合入 | 表格 | — | `review:"可合入"` | Title · Scope · Updated |
 | PR | 已合入 | 表格 | — | `review:"已合入"` | Title · Scope · Closed |
 | PR | 已关闭 | 表格 | — | `review:"已关闭"` | Title · Scope · Closed |
-| PR | 按 Scope | 表格 | **Scope** | — | Title · Review · Updated |
+| PR | 按 Scope | 表格 | **Scope** | — | Title · Scope · Review · Updated |
 | PR | 看板 | 看板 | **Review** | — | Title · Review · Scope |
 
-三条口径（改动时务必一起看）：
+四条口径（改动时务必一起看，都是 2026-10-25 实测出来的）：
 
 - **过滤器与可见列 = 脚本钉死**：`scripts/sync-projects.py` 里的 `PINNED_VIEWS`
   是唯一事实源，UI 上被人手改乱了会被下一轮同步改回来；`--selftest` 会校验这张表。
+  比对时比的是**集合**不是序列——`visibleFieldIds` 写进去的顺序会被 GitHub 按
+  「项目字段顺序」归一（写 `[Kind,Title,…]` 读回来仍是 `Title|Status|…`），
+  按序列比对会导致每轮同步都判定「列不一样」而重写。
+- **过滤器的值必须走 GraphQL 变量**：单选字段的 DSL 是 `review:"待审"` 这种**带双引号**
+  的写法，把值拼进 query 字符串会打成非法语法（2026-10-25 实测：#4 的
+  「可合入 / 已关闭」两个视图的过滤器就是这么静默写失败的）。
 - **分组 = 只能手点**：公开 GraphQL 的 `UpdateProjectV2ViewInput` 里**没有 groupBy 字段**
   ⇒ 表格视图的 `Group by` / 看板视图的 `Column by` 只能进 UI 落盘
   （面板改草稿 → 视图 kebab 菜单「Save changes to new view」→ 改名 → 删旧视图）。
   期望值记在脚本的 `PINNED_GROUPS` 里，脚本只能声明、无法校验。
+  ⚠️ 实测：**带过滤器的视图**上点「Save changes to new view」会静默失败（不建新视图）；
+  要做分组视图得拿一个**无过滤器**的载体视图来点。
 - **排序 = 存不住**：视图的 `Sort by` 在新版 UI 里只落 URL 草稿，面板 Save view 也留不下
   ⇒ 行序只能靠**建行顺序**保证（见上面同步规则里的「行序」一条）。
+
 
 ## 共享 workflow
 
