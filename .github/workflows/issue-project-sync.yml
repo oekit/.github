@@ -6,8 +6,11 @@ name: 大盘同步
 
 on:
   schedule:
-    # 每小时一次（避开整点，降压）
-    - cron: '17 * * * *'
+    # 【临时暂停】#4 行序重建（1100+ 行，约 4400 次写）正在 CI 里跑，
+    # 而整点同步与它共用 concurrency group「issue-project-sync」+ cancel-in-progress
+    # ⇒ 00:17 的整点跑会把重建**取消**掉（重建中断 = 看板半空）。
+    # 重建完成后立刻恢复本 cron（见 PR #32 之后的提交）。
+    # - cron: '17 * * * *'
   workflow_dispatch:
     inputs:
       reorder:
