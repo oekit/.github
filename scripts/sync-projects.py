@@ -501,29 +501,186 @@ def row_order_drift(proj: dict, plan: list[dict]) -> bool:
     return cur != want
 
 
+def _graphql_raw(query: str) -> dict:
+    """跑一条 GraphQL 并返回**原始文档**（容忍 errors）。
+
+    为什么不用 `gql()`：`gh api graphql` 在响应里带 errors 时**退出码非 0**
+    （哪怕 data 是全的），而批量场景里「一条坏、其余好」是常态
+    （例如某个 issue 号在仓库里不存在）⇒ 不能因为一条坏就把整批丢掉。
+    """
+    p = subprocess.run(
+        ["gh", "api", "graphql", "-f", f"query={query}"], capture_output=True, text=True
+    )
+    out = (p.stdout or "").strip()
+    if not out:
+        raise RuntimeError(f"gh api graphql 失败：{(p.stderr or '').strip()[:300]}")
+    try:
+        return json.loads(out)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"gh api graphql 返回非 JSON：{out[:200]}") from exc
+
+
+def _chunks(seq: list, size: int):
+    """按固定大小切块（批量写用）。"""
+    for i in range(0, len(seq), size):
+        yield seq[i : i + size]
+
+
+# 一次请求塞多少个 mutation。10 是实测的甜点：再大响应体和单请求耗时都上去了。
+BATCH_SIZE = 10
+
+
+def gql_batch(fields: list[str]) -> tuple[list[dict | None], list[str]]:
+    """一次请求发多个 mutation 字段（每个带 alias），返回 (各项结果, 错误说明)。
+
+    为什么必须批量：串行写一次 Projects 的 mutation ≈ 1.0s（CI 实测；本地跨网 ~2s）
+    ⇒ 1110 行的行序重建 = 5500+ 次串行写 ≈ 100 分钟，而重建期间看板是「半空」的
+    （先全删、再按序重加）⇒ 越快越好。合成 10 个 alias 一发 ⇒ 同样的写量 ~15 分钟。
+
+    **容忍部分失败**：一批里挂 1 个，不该把另外 9 个的成果一起丢掉
+    （串行写下一个失败只影响一行）。
+    """
+    if not fields:
+        return [], []
+    parts = [f"f{i}: {f}" for i, f in enumerate(fields)]
+    query = "mutation {\n" + "\n".join(parts) + "\n}"
+    doc = _graphql_raw(query)
+    data = doc.get("data") or {}
+    errs: list[str] = []
+    for e in doc.get("errors") or []:
+        errs.append(json.dumps(e, ensure_ascii=False)[:300])
+    out: list[dict | None] = []
+    for i in range(len(fields)):
+        v = data.get(f"f{i}")
+        out.append(v if isinstance(v, dict) else None)
+    return out, errs
+
+
+def resolve_content_ids(urls: list[str]) -> list[str | None]:
+    """批量把 PR/issue 的 URL 解析成 node id（GraphQL alias，一次 10 个）。
+
+    串行用 REST 解析 = 上千次子进程调用；这里一次请求查 10 个，
+    整板重建的解析开销从 ~20 分钟降到 ~2 分钟。
+    """
+    out: list[str | None] = [None] * len(urls)
+    for start in range(0, len(urls), BATCH_SIZE):
+        chunk = urls[start : start + BATCH_SIZE]
+        parts = []
+        for u in chunk:
+            try:
+                repo, num, kind = parse_github_url(u)
+            except ValueError:
+                continue
+            owner, _, name = repo.partition("/")
+            if kind == "pulls":
+                parts.append(
+                    f'repository(owner: "{owner}", name: "{name}")'
+                    f"{{ pullRequest(number: {num}) {{ id }} }}"
+                )
+            else:
+                parts.append(
+                    f'repository(owner: "{owner}", name: "{name}")'
+                    f"{{ issue(number: {num}) {{ id }} }}"
+                )
+        if not parts:
+            continue
+        query = "query {\n" + "\n".join(f"f{i}: {p}" for i, p in enumerate(parts)) + "\n}"
+        try:
+            doc = _graphql_raw(query)
+        except Exception as exc:
+            print(f"  ! 批量解析 node id 失败：{str(exc)[:200]}")
+            continue
+        data = doc.get("data") or {}
+        for i, u in enumerate(chunk):
+            v = data.get(f"f{i}") or {}
+            node = (v.get("pullRequest") or v.get("issue") or {}).get("id")
+            out[start + i] = node
+    return out
+
+
 def rebuild_rows(pid: str, board_items: list[dict], plan: list[dict]) -> tuple[int, int]:
     """按 plan 重建看板行：先全删，再按序重加，最后回填推导列。
+
+    **必须批量**：串行写一次 Projects 的 mutation ≈ 1.0s（CI 实测），
+    1110 行的重建 = 5500+ 次串行写 ≈ 100 分钟；而重建期间看板是「半空」的
+    （先全删、再按序重加）⇒ 越快越好。批量（10 个 alias 一发）后 ~15 分钟。
 
     返回 (成功行数, 跳过行数)。跳过 = 内容已被删掉（重加时 404），
     这类行本来就不该留在板上，跳过不影响其余行的顺序。
     """
-    for it in board_items:
-        delete_item(pid, it["id"])
+    # 1) 先把板上的行删干净（批量）
+    del_fields = [
+        f'deleteProjectV2Item(input: {{projectId: "{pid}", itemId: "{it["id"]}"}})'
+        "{ clientMutationId }"
+        for it in board_items
+    ]
+    for chunk in _chunks(del_fields, BATCH_SIZE):
+        gql_batch(chunk)
+
+    drafts = [r for r in plan if r["draft"]]
+    rest = [r for r in plan if not r["draft"]]
     ok = 0
     skipped = 0
-    for row in plan:
+
+    # 2) 草稿行先建（正文带换行 ⇒ 走 GraphQL 变量，塞不进批量）
+    for r in drafts:
         try:
-            if row["draft"]:
-                iid = add_draft(pid, row["title"], row["body"])
-            else:
-                iid = add_url(pid, row["url"])
+            iid = add_draft(pid, r["title"], r["body"])
         except Exception as exc:
             skipped += 1
-            print(f"  ! 重建跳过 {row.get('url') or row.get('title')}：{exc}")
+            print(f"  ! 重建跳过 {r.get('title')}：{str(exc)[:200]}")
             continue
-        for fid, oid in row["fields"]:
+        for fid, oid in r["fields"]:
             set_field_safe(pid, iid, fid, option_id=oid)
         ok += 1
+
+    # 3) 其余按规范序批量加（node id 也批量解析，省掉上千次 REST 子进程）
+    node_ids = resolve_content_ids([r["url"] for r in rest])
+    added: list[tuple[dict, str]] = []
+    for start in range(0, len(rest), BATCH_SIZE):
+        chunk = rest[start : start + BATCH_SIZE]
+        ids = node_ids[start : start + BATCH_SIZE]
+        fields = []
+        for row, nid in zip(chunk, ids):
+            if not nid:
+                continue
+            fields.append(
+                f'addProjectV2ItemById(input: {{projectId: "{pid}", contentId: "{nid}"}})'
+                "{ item { id } }"
+            )
+        if not fields:
+            for row, nid in zip(chunk, ids):
+                if not nid:
+                    skipped += 1
+                    print(f"  ! 重建跳过 {row.get('url')}：内容解析不到 node id")
+            continue
+        res, errs = gql_batch(fields)
+        for (row, nid), r in zip([(c, n) for c, n in zip(chunk, ids) if n], res):
+            item = (r or {}).get("item") or {}
+            iid = item.get("id")
+            if not iid:
+                skipped += 1
+                print(f"  ! 重建跳过 {row.get('url')}：入板失败")
+                continue
+            added.append((row, iid))
+        for e in errs:
+            print(f"  ! 批量入板报错：{e}")
+
+    # 4) 推导列回填（批量）
+    writes = []
+    for row, iid in added:
+        for fid, oid in row["fields"]:
+            writes.append((iid, fid, oid))
+    for chunk in _chunks(writes, BATCH_SIZE):
+        gql_batch(
+            [
+                f'updateProjectV2ItemFieldValue(input: {{projectId: "{pid}", itemId: "{iid}", '
+                f'fieldId: "{fid}", value: {{singleSelectOptionId: "{oid}"}}}})'
+                "{ projectV2Item { id } }"
+                for iid, fid, oid in chunk
+            ]
+        )
+    ok += len(added)
     return ok, skipped
 
 
@@ -1358,16 +1515,24 @@ def _write_view_filter(view_id: str, want: str) -> None:
 
 
 def add_draft(pid: str, title: str, body: str = "") -> str:
-    esc_t = title.replace("\\", "\\\\").replace('"', '\\"')
-    esc_b = body.replace("\\", "\\\\").replace('"', '\\"')
+    """建一行草稿（看板里的手工行）。
+
+    正文与标题走 **GraphQL 变量**：GraphQL 的字符串字面量里不能有裸换行，
+    拼进 query 字符串会让整个 mutation 变成 "Expected string or block string,
+    but it was malformed" ⇒ 草稿行**建不出来**（2026-10-25 实测：
+    #4 的行序重建跑完后，手工行没回来；根因就是这里没转义换行）。
+    """
     data = gql(
-        f"""
-        mutation {{
-          addProjectV2DraftIssue(input: {{
-            projectId: "{pid}", title: "{esc_t}", body: "{esc_b}"
-          }}) {{ projectItem {{ id }} }}
-        }}
         """
+        mutation($title: String!, $body: String) {
+          addProjectV2DraftIssue(input: {
+            projectId: "%s", title: $title, body: $body
+          }) { projectItem { id } }
+        }
+        """
+        % pid,
+        title=title,
+        body=body or "",
     )
     return data["addProjectV2DraftIssue"]["projectItem"]["id"]
 
@@ -1994,7 +2159,22 @@ def selftest() -> int:
     return 0
 
 
+def _enable_line_buffering() -> None:
+    """让 stdout 行缓冲。
+
+    2026-10-25 实测：#4 的行序重建跑到一半被整点同步 cancel 时，
+    **CI 日志里只剩第一行**（进程被杀 ⇒ 块缓冲的 stdout 没落盘），
+    现场完全看不到「删到第几行、重建到第几行」。
+    行缓冲后每个 print 立刻落盘 ⇒ 被 kill 也留得下已经发生的部分。
+    """
+    try:
+        sys.stdout.reconfigure(line_buffering=True)
+    except Exception:
+        pass  # stdout 不是 TextIOWrapper（例如被重定向成别的流）时忽略
+
+
 def main() -> int:
+    _enable_line_buffering()
     ap = argparse.ArgumentParser()
     ap.add_argument("--apply", action="store_true")
     ap.add_argument("--only", type=int, choices=[1, 2, 3, 4], help="只跑某块大盘")
