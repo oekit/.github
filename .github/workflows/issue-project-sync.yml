@@ -9,6 +9,11 @@ on:
     # 每小时一次（避开整点，降压）
     - cron: '17 * * * *'
   workflow_dispatch:
+    inputs:
+      reorder:
+        description: '强制重建看板行序（大板子用）：true=无视行数阈值重建，false=按默认'
+        type: boolean
+        default: false
   issues:
     types: [opened, closed, reopened]
   pull_request:
@@ -35,5 +40,13 @@ jobs:
           # 所需权限：project（读写）+ read:org
           GH_TOKEN: ${{ secrets.OEKIT_PROJECT_TOKEN }}
           ORG: oekit
+          # 手动触发时可要求重建行序；#4 PR 队列 1100+ 行一次重建 ≈4400 次写，
+          # 本地跑（跨网延迟 ~2s/次）要两个多小时，CI runner 上 ~15 分钟 ⇒ 走 CI。
+          REORDER: ${{ inputs.reorder }}
         run: |
-          python3 scripts/sync-projects.py --apply
+          if [ "$REORDER" = "true" ]; then
+            echo "::notice::按手动触发要求重建看板行序"
+            python3 scripts/sync-projects.py --apply --reorder
+          else
+            python3 scripts/sync-projects.py --apply
+          fi

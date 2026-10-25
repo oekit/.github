@@ -41,11 +41,55 @@ PROJECT_PR = 4
 RECENT_VIEW_NAME = "近期变更"
 RECENT_WINDOW_DAYS = 7
 
-# 钉死的语义型视图过滤器（值固定，不需要滚动）
-PINNED_VIEW_FILTERS = {
-    # 「嵌套模块」= Parent 非空的那些行。
-    # 旧值 `nested:*` 里的 nested 不是 Projects DSL 的字段名 ⇒ 该视图恒为 0 行。
-    "嵌套模块": "parent:*",
+# 钉死的视图配置：项目号 -> {视图名: {"filter": ..., "columns": [字段名, ...]}}
+#
+# 为什么要有这层：视图的**过滤器**与**可见列**是公开 GraphQL 写得下去的
+# （updateProjectV2View 的 filter / configuration{visibleFieldIds}）⇒ 可以脚本自愈，
+# UI 上被人手改乱了会被下一轮同步改回来。
+#
+# 但**分组**（表格视图的 Group by / 看板视图的 Column by）写不了：
+# UpdateProjectV2ViewInput 里没有 groupBy 字段 ⇒ 分组只能靠 UI 落盘，
+# 脚本这边只能**声明期望值**（见 PINNED_GROUPS），漂移时告警。
+#
+# 「嵌套模块」= Parent 非空的那些行。
+# 旧值 `nested:*` 里的 nested 不是 Projects DSL 的字段名 ⇒ 该视图恒为 0 行。
+PINNED_VIEWS: dict[int, dict[str, dict]] = {
+    PROJECT_VERSION: {
+        "嵌套模块": {"filter": "parent:*"},
+    },
+    PROJECT_ISSUE: {
+        "总览": {"filter": "", "columns": ["Title", "Status", "Kind", "Module", "Created"]},
+        "开启": {"filter": "status:Todo", "columns": ["Title", "Kind", "Module", "Created"]},
+        "关闭": {"filter": "status:Done", "columns": ["Title", "Kind", "Module", "Closed"]},
+        "看板": {"filter": "", "columns": ["Title", "Status", "Kind", "Module"]},
+        # 分组视图必须**看得见分组列**（按模块就要有 Module，按类型就要有 Kind）
+        "按模块": {"filter": "", "columns": ["Title", "Module", "Status", "Created"]},
+        "按类型": {"filter": "", "columns": ["Title", "Kind", "Module", "Created"]},
+    },
+    PROJECT_PR: {
+        "总览": {"filter": "", "columns": ["Title", "Review", "Scope", "Updated"]},
+        "待审": {"filter": 'review:"待审"', "columns": ["Title", "Scope", "Updated"]},
+        "审阅中": {"filter": 'review:"审阅中"', "columns": ["Title", "Scope", "Updated"]},
+        "可合入": {"filter": 'review:"可合入"', "columns": ["Title", "Scope", "Updated"]},
+        "已合入": {"filter": 'review:"已合入"', "columns": ["Title", "Scope", "Closed"]},
+        "已关闭": {"filter": 'review:"已关闭"', "columns": ["Title", "Scope", "Closed"]},
+        "按 Scope": {"filter": "", "columns": ["Title", "Scope", "Review", "Updated"]},
+        "看板": {"filter": "", "columns": ["Title", "Review", "Scope"]},
+    },
+}
+
+# 分组的期望值（Group by / Column by）——**只声明、只告警**，写不了。
+# 格式：项目号 -> {视图名: 分组字段名}
+PINNED_GROUPS: dict[int, dict[str, str]] = {
+    PROJECT_ISSUE: {
+        "看板": "Kind",
+        "按模块": "Module",
+        "按类型": "Kind",
+    },
+    PROJECT_PR: {
+        "看板": "Review",
+        "按 Scope": "Scope",
+    },
 }
 
 # ---------------------------------------------------------------------------
@@ -200,9 +244,9 @@ def load_project(number: int) -> dict:
                       id
                       type
                       content {
-                        ... on Issue { number url state title
+                        ... on Issue { number url state title createdAt
                                        repository { nameWithOwner } }
-                        ... on PullRequest { number url state title
+                        ... on PullRequest { number url state title createdAt
                                              repository { nameWithOwner } }
                         ... on DraftIssue { title body }
                       }
@@ -262,6 +306,8 @@ def load_project(number: int) -> dict:
                     "url": content.get("url"),
                     "title": content.get("title"),
                     "state": content.get("state"),
+                    "created": content.get("createdAt"),
+                    "body": content.get("body"),
                     "repo": (content.get("repository") or {}).get("nameWithOwner"),
                     "number": content.get("number"),
                     "fv": fv,
@@ -298,6 +344,23 @@ def set_field(pid: str, item_id: str, field_id: str, *, option_id: str | None = 
     )
 
 
+def set_field_safe(pid: str, item_id: str, field_id: str, **kw) -> bool:
+    """写字段，失败只告警不抛错。
+
+    为什么需要「安全版」：**并发重建**时另一轮同步可能正在处理同一批行，
+    其中一部分已经被删掉（行重建 = 全删 + 按序重加）⇒ 写字段会 404。
+    这种竞态不该把整轮同步打成红；写漏的字段下一轮会被 diff 出来补上（自愈）。
+
+    返回 True=写成功 / False=失败（调用方可统计）。
+    """
+    try:
+        set_field(pid, item_id, field_id, **kw)
+        return True
+    except Exception as exc:
+        print(f"  ! 写字段失败（item {item_id}）：{str(exc)[:200]}")
+        return False
+
+
 def add_url(pid: str, url: str) -> str:
     repo, num, kind = parse_github_url(url)
     node = subprocess.check_output(
@@ -320,6 +383,158 @@ def opt_map(field: dict | None) -> dict[str, str]:
     if not field:
         return {}
     return {o["name"]: o["id"] for o in field.get("options", [])}
+
+
+# ---------------------------------------------------------------------------
+# 行序维护（#1 Issue 大盘 / #4 PR 审查队列）
+# ---------------------------------------------------------------------------
+#
+# 为什么要单独一节：Projects v2 的行序 = **行的创建序**（items 数组按创建序返回），
+# 而公开 API 能写的东西里**没有 Sort by**（实测面板里也存不住），新行又只能追加到
+# 末尾 ⇒ 想让「最新的在最上面」，唯一手段是**按目标顺序把行重建**（全删 + 按序重加）。
+#
+# 代价是硬约束：每行 ≈ 1 删 + 1 加 + N 个推导列写。行数一多（#4 有 1100+ 行），
+# 一次重建就能把 GraphQL 的每小时 5000 点配额打穿 ⇒
+#   * 行数 ≤ REORDER_MAX_AUTO_ROWS：漂移时**自动重建**（自愈）；
+#   * 行数 >  阈值：只告警 + 提示 --reorder，不自动烧配额。
+#
+# 中断不会丢数据：重建是「先全删、再按序重加」，中途挂掉时缺行会被下一轮同步的
+# adds 路径补回；顺序漂移也会被下一轮漂移检测再次发现并重建 ⇒ 幂等、可自愈。
+
+REORDER_MAX_AUTO_ROWS = 500
+
+# 推导列之外、**不写**的字段：Title 是内置标题列（跟着内容走）；
+# Status 是 GitHub 自动同步的默认字段（open→Todo / closed→Done），
+# 实测 #4 的脚本从写 Status，但板上每一行都有 Status ⇒ 它是自动的。
+AUTO_FIELDS = ("Title", "Status")
+
+
+def _field_writes(fields_meta: dict, pairs: list[tuple[str, str | None]]) -> list[tuple[str, str]]:
+    """[(字段名, 值名)] -> [(field_id, option_id)]；模板里没有的字段/值直接跳过。"""
+    out: list[tuple[str, str]] = []
+    for fname, value in pairs:
+        meta = fields_meta.get(fname)
+        if not meta or value is None:
+            continue
+        opts = {o["name"]: o["id"] for o in meta.get("options", [])}
+        if value in opts:
+            out.append((meta["id"], opts[value]))
+    return out
+
+
+def build_row_plan(
+    proj: dict,
+    org_items: list[dict],
+    want_fields: dict[str, list[tuple[str, str | None]]],
+) -> list[dict]:
+    """合成「规范序」的行计划。
+
+    org_items    —— org 侧权威清单（url / title / createdAt）。
+    want_fields  —— url -> [(字段名, 目标值)]，只列**推导列**（Status 自动同步，不写）。
+
+    板上存在、但 org 清单里没有的行（草稿 SOP 行、跨仓 PR）**原样保留**：
+    草稿行钉在最前面，其余按 createdAt 倒序。
+    """
+    by_url = {it["url"]: it for it in proj["items"] if it.get("url")}
+    fields_meta = proj["fields"]
+    org_urls: set[str] = set()
+    plan: list[dict] = []
+
+    for o in org_items:
+        url = o["url"]
+        org_urls.add(url)
+        board = by_url.get(url)
+        plan.append(
+            {
+                "url": url,
+                "title": o.get("title") or (board or {}).get("title") or "",
+                "created": o.get("createdAt") or (board or {}).get("created") or "",
+                "draft": False,
+                "body": "",
+                "fields": _field_writes(fields_meta, want_fields.get(url, [])),
+            }
+        )
+
+    for it in proj["items"]:
+        if it.get("url") in org_urls:
+            continue
+        fv = {k: v for k, v in (it.get("fv") or {}).items() if k not in AUTO_FIELDS}
+        plan.append(
+            {
+                "url": it.get("url"),
+                "title": it.get("title") or "",
+                "created": it.get("created") or "",
+                "draft": not it.get("url"),
+                "body": it.get("body") or "",
+                "fields": _field_writes(
+                    fields_meta, [(k, v) for k, v in fv.items() if isinstance(v, str)]
+                ),
+            }
+        )
+
+    drafts = [p for p in plan if p["draft"]]
+    rest = sorted(
+        [p for p in plan if not p["draft"]], key=lambda p: p["created"], reverse=True
+    )
+    return drafts + rest
+
+
+def row_order_drift(proj: dict, plan: list[dict]) -> bool:
+    """板上的实际行序 vs 规范序——不一致即为漂移（需要重建）。"""
+    cur = [it.get("url") for it in proj["items"] if it.get("url")]
+    want = [p["url"] for p in plan if not p["draft"]]
+    return cur != want
+
+
+def rebuild_rows(pid: str, board_items: list[dict], plan: list[dict]) -> tuple[int, int]:
+    """按 plan 重建看板行：先全删，再按序重加，最后回填推导列。
+
+    返回 (成功行数, 跳过行数)。跳过 = 内容已被删掉（重加时 404），
+    这类行本来就不该留在板上，跳过不影响其余行的顺序。
+    """
+    for it in board_items:
+        delete_item(pid, it["id"])
+    ok = 0
+    skipped = 0
+    for row in plan:
+        try:
+            if row["draft"]:
+                iid = add_draft(pid, row["title"], row["body"])
+            else:
+                iid = add_url(pid, row["url"])
+        except Exception as exc:
+            skipped += 1
+            print(f"  ! 重建跳过 {row.get('url') or row.get('title')}：{exc}")
+            continue
+        for fid, oid in row["fields"]:
+            set_field_safe(pid, iid, fid, option_id=oid)
+        ok += 1
+    return ok, skipped
+
+
+def maintain_row_order(
+    proj: dict,
+    plan: list[dict],
+    apply: bool,
+    force: bool = False,
+) -> bool:
+    """行序自愈入口：漂移 ⇒ 重建。返回是否真的重建了。"""
+    if not row_order_drift(proj, plan):
+        return False
+    n = len(proj["items"])
+    if not (force or n <= REORDER_MAX_AUTO_ROWS):
+        print(
+            f"  ! 行序漂移（{n} 行 > 自动重建阈值 {REORDER_MAX_AUTO_ROWS}）——"
+            "不自动重建以免打穿配额；需要时手工跑 --reorder"
+        )
+        return False
+    if not apply:
+        print(f"  ! 行序漂移：将按 createdAt 倒序重建 {n} 行（dry-run，未写入）")
+        return False
+    print(f"  ! 行序漂移：按 createdAt 倒序重建 {n} 行")
+    ok, skipped = rebuild_rows(proj["id"], proj["items"], plan)
+    print(f"  ✓ 重建完成：{ok} 行重排（跳过 {skipped}）")
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -406,7 +621,7 @@ def list_org_issues() -> list[dict]:
                 # 总览第一屏全是两年前的旧 issue，新的全堆在末尾）
                 "--sort", "created",
                 "--order", "desc",
-                "--json", "repository,title,number,url,state",
+                "--json", "repository,title,number,url,state,createdAt",
             ],
             text=True,
         )
@@ -421,7 +636,7 @@ def list_org_issues() -> list[dict]:
     return issues
 
 
-def sync_issue_board(apply: bool) -> None:
+def sync_issue_board(apply: bool, force_reorder: bool = False) -> None:
     print("\n=== #1 Issue 大盘 ===")
     proj = load_project(PROJECT_ISSUE)
     status_opts = opt_map(proj["fields"].get("Status"))
@@ -439,7 +654,8 @@ def sync_issue_board(apply: bool) -> None:
     syncs: list[dict] = []
     for iss in issues:
         # gh search 返回小写 open/closed，GraphQL 是大写 OPEN/CLOSED——统一不敏感比较
-        want_status = "Todo" if iss["state"].upper() == "OPEN" else "Done"
+        cur_status = (by_url.get(iss["url"]) or {}).get("fv", {}).get("Status")
+        want_status = want_issue_status(iss["state"], cur_status)
         want_kind = infer_kind(iss["title"])
         want_mod = infer_module(iss.get("repository", ""), iss["title"])
         if iss["url"] not in by_url:
@@ -485,21 +701,35 @@ def sync_issue_board(apply: bool) -> None:
         if s["mod"] and s["mod"] != s["cur_mod"]:
             bits.append(f"mod:{s['cur_mod']}→{s['mod']}")
         print(f"  ~ {s['title'][:48]}  → {'/'.join(bits)}")
+
+    # —— 行序：规范序 = createdAt 倒序（新的在最前）——
+    # 漂移时走重建路径（重建里已包含新增行 + 推导列回填，不必再走增量）。
+    want_fields = {
+        iss["url"]: [
+            ("Kind", infer_kind(iss["title"])),
+            ("Module", infer_module(iss.get("repository", ""), iss["title"])),
+        ]
+        for iss in issues
+    }
+    plan = build_row_plan(proj, issues, want_fields)
+    if maintain_row_order(proj, plan, apply, force=force_reorder):
+        return
+
     if not apply:
         print("  (dry-run)")
         return
 
     def assign(iid: str, status: str, kind: str | None, mod: str | None) -> None:
         if status in status_opts:
-            set_field(proj["id"], iid, status_id, option_id=status_opts[status])
+            set_field_safe(proj["id"], iid, status_id, option_id=status_opts[status])
         if kind and kind in kind_opts and kind_id:
-            set_field(proj["id"], iid, kind_id, option_id=kind_opts[kind])
+            set_field_safe(proj["id"], iid, kind_id, option_id=kind_opts[kind])
         if mod and mod in mod_opts and mod_id:
-            set_field(proj["id"], iid, mod_id, option_id=mod_opts[mod])
+            set_field_safe(proj["id"], iid, mod_id, option_id=mod_opts[mod])
         elif mod and mod_id:
             # 模板里没有的模块名，落 meta，避免整列空着
             if "meta" in mod_opts:
-                set_field(proj["id"], iid, mod_id, option_id=mod_opts["meta"])
+                set_field_safe(proj["id"], iid, mod_id, option_id=mod_opts["meta"])
 
     for a in adds:
         iid = add_url(proj["id"], a["url"])
@@ -566,6 +796,46 @@ def infer_review(state: str) -> str:
     return "已关闭"
 
 
+# Review 字段的**人工流转态**：PR 还开着时，人会在板上把它挪进这几档。
+MANUAL_REVIEW_STATES = ("审阅中", "需修改", "可合入")
+
+# Status 字段的人工态：issue 还开着时，人可以在板上标 In Progress。
+MANUAL_STATUS_STATES = ("In Progress",)
+
+
+def want_issue_status(issue_state: str, cur: str | None) -> str:
+    """Status 该取什么值——和 want_review 同一套「脚本 / 人工分权」。
+
+    closed ⇒ Done（终态，脚本说了算）；open ⇒ 人工挪到 In Progress 的不许被冲掉，
+    其余落 Todo。
+    """
+    if (issue_state or "").upper() == "CLOSED":
+        return "Done"
+    if cur in MANUAL_STATUS_STATES:
+        return cur
+    return "Todo"
+
+
+def want_review(pr_state: str, cur: str | None) -> str:
+    """Review 该取什么值——分清「脚本说了算」与「人工说了算」。
+
+    - PR 落到终态（merged / closed）⇒ 脚本说了算：已合入 / 已关闭；
+    - PR 还开着 ⇒ 人工在板上流转（审阅中 / 需修改 / 可合入），**脚本不能冲掉**；
+      只有还没人动过（当前为空）时才落 待审。
+
+    为什么必须这么分：旧实现对**每一行**都写 infer_review(state)
+    ⇒ 人工把 PR 挪到「审阅中」，每小时的定时同步就把它打回「待审」，
+    人工流转被脚本吃掉（Review 字段有 6 档，脚本只会写 3 档，
+    另外 3 档正是人工流转用的）。
+    """
+    s = (pr_state or "").upper()
+    if s in ("MERGED", "CLOSED"):
+        return infer_review(s)
+    if cur in MANUAL_REVIEW_STATES:
+        return cur
+    return "待审"
+
+
 def list_org_prs() -> list[dict]:
     prs: list[dict] = []
     seen: set[str] = set()
@@ -580,7 +850,7 @@ def list_org_prs() -> list[dict]:
                 # 按创建时间倒序：板子的行序 = 入板顺序 ⇒ 新进的 PR 排在最前
                 "--sort", "created",
                 "--order", "desc",
-                "--json", "repository,title,number,url,state",
+                "--json", "repository,title,number,url,state,createdAt",
             ],
             text=True,
         )
@@ -595,7 +865,7 @@ def list_org_prs() -> list[dict]:
     return prs
 
 
-def sync_pr_board(apply: bool) -> None:
+def sync_pr_board(apply: bool, force_reorder: bool = False) -> None:
     print("\n=== #4 PR 审查队列 ===")
     proj = load_project(PROJECT_PR)
     review_opts = opt_map(proj["fields"].get("Review"))
@@ -610,21 +880,21 @@ def sync_pr_board(apply: bool) -> None:
     adds: list[dict] = []
     syncs: list[dict] = []
     for pr in prs:
-        want_review = infer_review(pr["state"])
+        cur_review = (by_url.get(pr["url"]) or {}).get("fv", {}).get("Review")
+        want_rev = want_review(pr["state"], cur_review)
         want_scope = infer_scope(pr["title"])
         if pr["url"] not in by_url:
-            adds.append({**pr, "want_review": want_review, "want_scope": want_scope})
+            adds.append({**pr, "want_review": want_rev, "want_scope": want_scope})
             continue
         item = by_url[pr["url"]]
-        cur_review = item["fv"].get("Review")
         cur_scope = item["fv"].get("Scope")
-        # Review 跟 state 走；Scope 跟标题 CC 类型走（都是推导列）
-        if cur_review != want_review or (want_scope and cur_scope != want_scope):
+        # Review：终态由脚本说了算，在途的人工流转态由人工说了算；Scope 是推导列，跟标题走
+        if cur_review != want_rev or (want_scope and cur_scope != want_scope):
             syncs.append(
                 {
                     "id": item["id"],
                     "title": pr["title"],
-                    "review": want_review,
+                    "review": want_rev,
                     "scope": want_scope,
                     "cur_scope": cur_scope,
                 }
@@ -637,15 +907,35 @@ def sync_pr_board(apply: bool) -> None:
         if s.get("scope") and s["scope"] != s.get("cur_scope"):
             bits.append(f"scope:{s.get('cur_scope')}→{s['scope']}")
         print(f"  ~ {s['title'][:48]}  → {'/'.join(bits)}")
+
+    # —— 行序：规范序 = createdAt 倒序（新的在最前）——
+    # #4 有 1100+ 行 ⇒ 一次重建 ≈ 4400 次写，**超过自动阈值**：
+    # 漂移时只告警并提示 --reorder（避免每小时定时任务把配额打穿）。
+    want_fields = {
+        pr["url"]: [
+            (
+                "Review",
+                want_review(
+                    pr["state"], (by_url.get(pr["url"]) or {}).get("fv", {}).get("Review")
+                ),
+            ),
+            ("Scope", infer_scope(pr["title"])),
+        ]
+        for pr in prs
+    }
+    plan = build_row_plan(proj, prs, want_fields)
+    if maintain_row_order(proj, plan, apply, force=force_reorder):
+        return
+
     if not apply:
         print("  (dry-run)")
         return
 
     def assign(iid: str, review: str, scope: str | None) -> None:
         if review in review_opts:
-            set_field(proj["id"], iid, review_id, option_id=review_opts[review])
+            set_field_safe(proj["id"], iid, review_id, option_id=review_opts[review])
         if scope and scope in scope_opts and scope_id:
-            set_field(proj["id"], iid, scope_id, option_id=scope_opts[scope])
+            set_field_safe(proj["id"], iid, scope_id, option_id=scope_opts[scope])
 
     for a in adds:
         iid = add_url(proj["id"], a["url"])
@@ -850,15 +1140,42 @@ def delete_item(pid: str, item_id: str) -> None:
     )
 
 
-def project_views(number: int) -> tuple[str, list[dict]]:
-    """返回 (project id, 视图列表)。视图 id 会变，故按**名字**定位，不写死 id。"""
+def _view_config(number: int) -> tuple[str, list[dict], dict[str, dict]]:
+    """返回 (project id, 视图列表（含可见列）, 字段表 name->field)。
+
+    视图 id 会变，故按**名字**定位，不写死 id。
+    注意：读 `ProjectV2View.configuration` 会触发 GitHub 服务端错误，
+    所以列要从 `ProjectV2View.fields` 读。
+    """
     data = gql(
         """
         query($org: String!, $number: Int!) {
           organization(login: $org) {
             projectV2(number: $number) {
               id
-              views(first: 20) { nodes { id name filter } }
+              fields(first: 50) {
+                nodes {
+                  ... on ProjectV2Field { id name }
+                  ... on ProjectV2SingleSelectField {
+                    id name
+                    options { id name }
+                  }
+                }
+              }
+              views(first: 20) {
+                nodes {
+                  id
+                  name
+                  filter
+                  layout
+                  fields(first: 20) {
+                    nodes {
+                      ... on ProjectV2Field { id name }
+                      ... on ProjectV2SingleSelectField { id name }
+                    }
+                  }
+                }
+              }
             }
           }
         }
@@ -867,7 +1184,24 @@ def project_views(number: int) -> tuple[str, list[dict]]:
         number=str(number),
     )
     proj = data["organization"]["projectV2"]
-    return proj["id"], proj["views"]["nodes"]
+    fields = {f["name"]: f for f in proj["fields"]["nodes"]}
+    views = [
+        {
+            "id": v["id"],
+            "name": v.get("name"),
+            "filter": v.get("filter") or "",
+            "layout": v.get("layout"),
+            "columns": [n.get("name") for n in v.get("fields", {}).get("nodes", [])],
+        }
+        for v in proj["views"]["nodes"]
+    ]
+    return proj["id"], views, fields
+
+
+def project_views(number: int) -> tuple[str, list[dict]]:
+    """返回 (project id, 视图列表)。视图 id 会变，故按**名字**定位，不写死 id。"""
+    pid, views, _fields = _view_config(number)
+    return pid, views
 
 
 def roll_recent_changes_view(apply: bool) -> None:
@@ -903,43 +1237,102 @@ def roll_recent_changes_view(apply: bool) -> None:
     _write_view_filter(target["id"], want)
 
 
-def sync_pinned_view_filters(apply: bool) -> None:
-    """钉死语义型视图的过滤器（值固定，不需要滚动）。
+def sync_pinned_view_configs(apply: bool) -> None:
+    """把视图的过滤器与可见列钉死（#1 / #2 / #4）。
 
-    「嵌套模块」= Parent 非空的那些行 ⇒ `parent:*`。
-    旧值 `nested:*` 是个**不存在的字段名**（Projects DSL 里没有 nested 这个字段）
-    ⇒ 该视图恒为空（实测 0 行），而且看板上不报错——只能靠对账发现。
+    过滤器：语义型视图的值固定（如「嵌套模块」= `parent:*`），写错会让视图恒为
+    0 行，而且看板上不报错——只能靠这道钉子兜住。
+    旧值 `nested:*` 里的 nested 是个**不存在的字段名**（Projects DSL 里没有 nested）
+    ⇒ 「嵌套模块」视图实测恒为空。
+
+    可见列：列序 = 视图里字段的顺序，钉死它可防 UI 上被人手拖乱。
+
+    分组不在这里：Group by / Column by **写不了**（见 PINNED_GROUPS 的说明），
+    只在这里声明期望值、漂移时告警。
     """
-    try:
-        _pid, views = project_views(PROJECT_VERSION)
-    except Exception as exc:
-        print(f"  ! 读取视图列表失败（{exc}）——跳过过滤器对齐")
-        return
-    by_name = {v.get("name"): v for v in views}
-    for name, want in PINNED_VIEW_FILTERS.items():
-        v = by_name.get(name)
-        if not v:
-            print(f"  ! 视图「{name}」不存在——跳过过滤器对齐")
+    for number, spec in PINNED_VIEWS.items():
+        try:
+            _pid, views, fields = _view_config(number)
+        except Exception as exc:
+            print(f"  ! 读取 #{number} 视图配置失败（{exc}）——跳过")
             continue
-        cur = v.get("filter") or ""
-        if cur == want:
-            continue
-        print(f"  ~ {name} 过滤器：{cur or '(空)'} → {want}")
-        if apply:
-            _write_view_filter(v["id"], want)
+        by_name = {v["name"]: v for v in views}
+        for name, want in spec.items():
+            v = by_name.get(name)
+            if not v:
+                print(f"  ! #{number} 视图「{name}」不存在——跳过")
+                continue
+            want_filter = want.get("filter")
+            if want_filter is not None and (v.get("filter") or "") != want_filter:
+                print(f"  ~ #{number} {name} 过滤器：{v.get('filter') or '(空)'} → {want_filter}")
+                if apply:
+                    _write_view_filter(v["id"], want_filter)
+            want_cols = want.get("columns")
+            if want_cols:
+                want_ids = [fields[c]["id"] for c in want_cols if c in fields]
+                cur_ids = [fields[c]["id"] for c in v["columns"] if c in fields]
+                # 比**集合**而不是序列：实测 visibleFieldIds 写进去的顺序会被 GitHub
+                # 按「项目字段顺序」归一（写 [Kind,Title,Module,Status,Created] 读回来
+                # 仍是 Title|Status|Created|Kind|Module）⇒ 按序列比对会导致每轮同步
+                # 都判定「列不一样」而重写（噪音，且会冲掉 UI 里拖出来的列序）。
+                if sorted(cur_ids) != sorted(want_ids):
+                    print(f"  ~ #{number} {name} 列：{v['columns']} → {want_cols}")
+                    if apply:
+                        _write_view_columns(v["id"], want_ids)
 
 
-def _write_view_filter(view_id: str, want: str) -> None:
-    """写视图过滤器；失败只告警不抛错（视图配置挂了不该拖垮看板同步）。"""
+def _write_view_columns(view_id: str, field_ids: list[str]) -> None:
+    """写视图可见列（顺序即列序）；失败只告警不抛错（视图配置挂了不该拖垮看板同步）。"""
+    ids = ", ".join(f'"{i}"' for i in field_ids)
     try:
         gql(
             f"""
             mutation {{
               updateProjectV2View(input: {{
-                viewId: "{view_id}", filter: "{want}"
-              }}) {{ projectV2View {{ id name filter }} }}
+                viewId: "{view_id}",
+                configuration: {{ visibleFieldIds: [{ids}] }}
+              }}) {{ projectV2View {{ id name }} }}
             }}
             """
+        )
+    except Exception as exc:
+        print(f"  ! 写视图可见列失败（{exc}）——看板数据不受影响，继续")
+
+
+def check_pinned_groups(apply: bool = False) -> None:
+    """分组（Group by / Column by）只能手点，脚本只能**声明期望值**。
+
+    读分组要靠 GraphQL 的 groupByFields —— 实测该字段在所有板上都返回空
+    （Projects v2 的公开 API 不暴露视图的分组）⇒ 这里**做不了自动校验**，
+    只把期望值打印出来供人工对照（README 里也写了同样的表）。
+    apply=True 时不打印，避免每次定时同步都刷一堆没有信息量的日志。
+    """
+    if apply:
+        return
+    for number, groups in PINNED_GROUPS.items():
+        for name, field in groups.items():
+            print(f"  · #{number} 视图「{name}」期望分组：{field}（只能 UI 落盘，脚本无法校验）")
+
+
+def _write_view_filter(view_id: str, want: str) -> None:
+    """写视图过滤器；失败只告警不抛错（视图配置挂了不该拖垮看板同步）。
+
+    过滤器值里**可能带双引号**（单选字段的 DSL 就是 `review:"待审"` 这种写法）
+    ⇒ 必须走 **GraphQL 变量**，把值拼进 query 字符串会打成非法语法：
+    实测 2026-10-25，#4 的「可合入 / 已关闭」两个视图的过滤器就是这么写失败的
+    （报错被截断成 "写视图过滤器失败"，差点被当成配额问题）。
+    """
+    try:
+        gql(
+            """
+            mutation($filter: String!) {
+              updateProjectV2View(input: {
+                viewId: "%s", filter: $filter
+              }) { projectV2View { id name filter } }
+            }
+            """
+            % view_id,
+            filter=want,
         )
     except Exception as exc:
         print(f"  ! 写视图过滤器失败（{exc}）——看板数据不受影响，继续")
@@ -1259,10 +1652,8 @@ def link_item(url: str, state: str) -> None:
     repo, num, kind = parse_github_url(url)  # kind: issues|pulls
     if kind == "pulls":
         proj_num = PROJECT_PR
-        want_review = infer_review(state)
     else:
         proj_num = PROJECT_ISSUE
-        want_status = "Todo" if state.upper() == "OPEN" else "Done"
 
     # 取 title 便于 Kind/Scope
     meta = gh_json(["api", f"repos/{repo}/{kind}/{num}"])
@@ -1282,6 +1673,8 @@ def link_item(url: str, state: str) -> None:
         status_opts = opt_map(proj["fields"].get("Status"))
         kind_opts = opt_map(proj["fields"].get("Kind"))
         mod_opts = opt_map(proj["fields"].get("Module"))
+        cur_status = (item or {}).get("fv", {}).get("Status")
+        want_status = want_issue_status(state, cur_status)
         want_kind = infer_kind(title)
         want_mod = infer_module(repo, title)
         if want_status in status_opts:
@@ -1296,10 +1689,11 @@ def link_item(url: str, state: str) -> None:
     else:
         review_opts = opt_map(proj["fields"].get("Review"))
         scope_opts = opt_map(proj["fields"].get("Scope"))
-        want_review = infer_review(state)
+        cur_review = (item or {}).get("fv", {}).get("Review")
+        want_rev = want_review(state, cur_review)
         want_scope = infer_scope(title)
-        if want_review in review_opts:
-            set_field(proj["id"], iid, proj["fields"]["Review"]["id"], option_id=review_opts[want_review])
+        if want_rev in review_opts:
+            set_field(proj["id"], iid, proj["fields"]["Review"]["id"], option_id=review_opts[want_rev])
         if want_scope in scope_opts:
             set_field(proj["id"], iid, proj["fields"]["Scope"]["id"], option_id=scope_opts[want_scope])
         print(f"  ✓ pr     review={want_review} scope={want_scope}  {title[:50]}")
@@ -1506,6 +1900,73 @@ def selftest() -> int:
             "请把 _FALLBACK_MODULES / _FALLBACK_NESTED 更新到一致"
         )
 
+    # 4) 行序：规范序 = 草稿钉最前 + createdAt 倒序；漂移检测要能认出「反了」
+    fake_fields = {
+        "Kind": {"id": "F-KIND", "options": [{"id": "O-BUG", "name": "Bug"}]},
+    }
+    org_items = [
+        {"url": "u1", "title": "old", "createdAt": "2026-10-01T00:00:00Z"},
+        {"url": "u2", "title": "new", "createdAt": "2026-10-20T00:00:00Z"},
+        {"url": "u3", "title": "mid", "createdAt": "2026-10-10T00:00:00Z"},
+    ]
+    fake_board = {
+        "fields": fake_fields,
+        "items": [
+            {"id": "i-draft", "url": None, "title": "SOP", "created": None, "body": "b", "fv": {}},
+            {"id": "i-new", "url": "u2", "title": "new", "created": "2026-10-20T00:00:00Z", "fv": {}},
+            {"id": "i-mid", "url": "u3", "title": "mid", "created": "2026-10-10T00:00:00Z", "fv": {}},
+            {"id": "i-old", "url": "u1", "title": "old", "created": "2026-10-01T00:00:00Z", "fv": {}},
+        ],
+    }
+    plan = build_row_plan(fake_board, org_items, {"u1": [("Kind", "Bug")]})
+    plan_urls = [p["url"] for p in plan]
+    if plan_urls != [None, "u2", "u3", "u1"]:
+        fails.append(f"build_row_plan 顺序 = {plan_urls}，期望 [None, 'u2', 'u3', 'u1']")
+    row_u1 = next((p for p in plan if p["url"] == "u1"), None)
+    if not row_u1 or row_u1["fields"] != [("F-KIND", "O-BUG")]:
+        fails.append(f"build_row_plan 没把推导列写成 (field_id, option_id)：{row_u1}")
+    if row_order_drift(fake_board, plan):
+        fails.append("row_order_drift 对「已经是规范序」误报漂移")
+    shuffled = dict(fake_board, items=list(reversed(fake_board["items"])))
+    if not row_order_drift(shuffled, plan):
+        fails.append("row_order_drift 对「顺序反了」漏报漂移")
+    # 草稿行必须钉在最前，且重建时不丢正文
+    if not plan[0]["draft"] or plan[0]["body"] != "b":
+        fails.append("build_row_plan 没把草稿行钉在最前 / 丢了正文")
+
+    # 5) 视图钉死表：过滤器与列必须字段名齐全（写错的名字会被静默跳过）
+    for number, spec in PINNED_VIEWS.items():
+        for name, want in spec.items():
+            for col in want.get("columns", []):
+                if col not in ("Title", "Status", "Kind", "Module", "Created", "Closed",
+                               "Review", "Scope", "Updated"):
+                    fails.append(f"#{number} 视图「{name}」钉了未知列 {col}")
+
+    # 6) 人工流转态不许被脚本冲掉（Review / Status 都一样）
+    review_cases = [
+        ("merged", "审阅中", "已合入"),   # 落到终态 ⇒ 脚本说了算
+        ("closed", "审阅中", "已关闭"),
+        ("open", "审阅中", "审阅中"),     # 在途的人工流转态 ⇒ 原样保留
+        ("open", "需修改", "需修改"),
+        ("open", "可合入", "可合入"),
+        ("open", None, "待审"),          # 没人动过 ⇒ 落待审
+        ("open", "待审", "待审"),
+    ]
+    for state, cur, want in review_cases:
+        got = want_review(state, cur)
+        if got != want:
+            fails.append(f"want_review({state!r}, {cur!r}) = {got!r}，期望 {want!r}")
+    status_cases = [
+        ("closed", "In Progress", "Done"),
+        ("open", "In Progress", "In Progress"),
+        ("open", None, "Todo"),
+        ("open", "Todo", "Todo"),
+    ]
+    for state, cur, want in status_cases:
+        got = want_issue_status(state, cur)
+        if got != want:
+            fails.append(f"want_issue_status({state!r}, {cur!r}) = {got!r}，期望 {want!r}")
+
     for f in fails:
         print(f"FAIL {f}")
     if fails:
@@ -1528,7 +1989,12 @@ def main() -> int:
     ap.add_argument(
         "--selftest",
         action="store_true",
-        help="离线自测：嵌套 tag 解析 / 真相源装载 / Layer 覆盖（不触网）",
+        help="离线自测：嵌套 tag 解析 / 真相源装载 / Layer 覆盖 / 行序规则（不触网）",
+    )
+    ap.add_argument(
+        "--reorder",
+        action="store_true",
+        help="强制重建看板行序（#1/#4），无视行数阈值——大板子必须手工指定",
     )
     args = ap.parse_args()
 
@@ -1564,15 +2030,17 @@ def main() -> int:
 
     only = args.only
     if only in (None, 1):
-        sync_issue_board(args.apply)
+        sync_issue_board(args.apply, force_reorder=args.reorder)
     if only in (None, 4):
-        sync_pr_board(args.apply)
+        sync_pr_board(args.apply, force_reorder=args.reorder)
     if only in (None, 2):
         sync_version_board(args.apply)
-        sync_pinned_view_filters(args.apply)
         roll_recent_changes_view(args.apply)
     if only in (None, 3):
         sync_health_board(args.apply)
+    # 视图的过滤器/可见列钉死（三块板统一在这里收口）
+    sync_pinned_view_configs(args.apply)
+    check_pinned_groups(args.apply)
     print("\nOK")
     return 0
 
