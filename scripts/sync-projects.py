@@ -25,6 +25,7 @@ from __future__ import annotations
 import argparse
 import datetime
 import json
+import time
 import os
 import re
 import subprocess
@@ -520,6 +521,26 @@ def _graphql_raw(query: str) -> dict:
         raise RuntimeError(f"gh api graphql 返回非 JSON：{out[:200]}") from exc
 
 
+def _graphql_raw_retry(query: str, attempts: int = 3) -> dict:
+    """跑一条 GraphQL，**重试瞬时故障**。
+
+    2026-10-26 实测：大批量 mutation 偶尔会收到 GitHub 的 **HTML 错误页**
+    （"Hello future GitHubber! I bet you're here to remove those nasty inline styles"
+    —— 那是 GitHub 500 页的正文），一次就足以把整个同步 job 打死：
+    行序重建跑到一半撞上它 ⇒ job 失败 ⇒ **板上少了 124 行**（删了没加回来）。
+    ⇒ 重试 3 次（退避递增），仍失败就抛（调用方决定是跳过还是致命）。
+    """
+    last: str = ""
+    for i in range(attempts):
+        try:
+            return _graphql_raw(query)
+        except Exception as exc:
+            last = str(exc)[:200]
+            if i + 1 < attempts:
+                time.sleep(2 * (i + 1))
+    raise RuntimeError(f"gh api graphql 重试 {attempts} 次仍失败：{last}")
+
+
 def _chunks(seq: list, size: int):
     """按固定大小切块（批量写用）。"""
     for i in range(0, len(seq), size):
@@ -544,7 +565,13 @@ def gql_batch(fields: list[str]) -> tuple[list[dict | None], list[str]]:
         return [], []
     parts = [f"f{i}: {f}" for i, f in enumerate(fields)]
     query = "mutation {\n" + "\n".join(parts) + "\n}"
-    doc = _graphql_raw(query)
+    try:
+        doc = _graphql_raw_retry(query)
+    except Exception as exc:
+        # 一批全挂**不致命**：这批的行没写成 ⇒ 下一轮同步按 diff 补回来
+        # （行重建是「全删 + 按序重加」，少加的行下一轮会以 adds 的形式补上）。
+        print(f"  ! 批量写整批失败（{len(fields)} 条）：{str(exc)[:200]}")
+        return [None] * len(fields), [str(exc)[:300]]
     data = doc.get("data") or {}
     errs: list[str] = []
     for e in doc.get("errors") or []:
