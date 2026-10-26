@@ -14,10 +14,13 @@ on:
         description: '强制重建看板行序（大板子用）：true=无视行数阈值重建，false=按默认'
         type: boolean
         default: false
-  issues:
-    types: [opened, closed, reopened]
-  pull_request:
-    types: [opened, closed, reopened]
+  # **不**再监听 issues / pull_request：单条入板已由 `issue-to-project.yml`
+  # （即时入板）按条目号隔离地做掉了，这里再跑一遍全量是冗余的。
+  # 而它有代价：同一个 concurrency group + cancel-in-progress ⇒ 每来一个
+  # PR 事件就起一轮同步，**把排队的整点同步取消掉**。
+  # 实测 2026-10-26：20 小时里 63 次 PR 事件，把每小时那次整点同步挤到只剩 2 次
+  # （整点同步一旦被取消，下次要再等一小时 ⇒ 新 issue/PR 最坏延迟 1 小时以上）。
+  # ⇒ 整点同步只保留 schedule + 手动触发，单条入板交给「即时入板」。
 
 permissions:
   contents: read
