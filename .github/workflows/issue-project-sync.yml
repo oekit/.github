@@ -5,11 +5,9 @@ name: 大盘同步
 # 事件触发只覆盖本仓（oekit/.github），跨仓靠下面的轮询。
 
 on:
-  # 【临时暂停】整点定时（每小时的 `17 * * * *`）已整段移除：
-  # #4 行序重建（1100+ 行 / 约 4400 次写）正在 CI 里跑，而整点同步与它共用
-  # concurrency group「issue-project-sync」+ cancel-in-progress
-  # ⇒ 整点跑会把重建**取消**掉（重建是「先全删、再按序重加」，
-  # 中断就留下**半空的看板**）。重建跑完后立刻把 schedule 段加回来。
+  schedule:
+    # 每小时一次（避开整点，降压）
+    - cron: '17 * * * *'
   workflow_dispatch:
     inputs:
       reorder:

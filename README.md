@@ -74,7 +74,7 @@ gh auth refresh -s project
 
 | 大盘 | 视图 |
 |---|---|
-| Issue 大盘 | 总览 · 开启(`status:Todo`) · 关闭(`status:Done`) · 看板 · 按模块 · 按类型 |
+| Issue 大盘 | 总览 · 开启(`status:Todo`) · 关闭(`status:Done`) · 按模块 · 按类型 · 看板 |
 | 版本大盘 | 总览 · 按层级(Board) · 嵌套模块(`Parent` 非空) · 近期变更 |
 | 矩阵健康 | 总览 · 有漂移 · 全绿 · 待审计 · 看板 |
 | PR 审查队列 | 总览 · 待审 · 审阅中 · 已合入 · 可合入 · 已关闭 · 按 Scope · 看板 |
