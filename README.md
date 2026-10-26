@@ -35,8 +35,21 @@ GitHub Projects **不会**自动纳入 issue/PR，也不会跟进 tag。本仓�
 | 通道 | 触发 | 做什么 |
 |---|---|---|
 | 各仓 `issue-to-project.yml` | issue/PR 开关、tag 推送、main 提交 | **秒级**入板/刷新（`--link` / `--refresh-module`） |
-| `issue-project-sync.yml` | 每小时 + 手动 | 全量对齐四块大盘（`--apply`） |
+| `issue-project-sync.yml` | **每小时 + 手动** | 全量对齐四块大盘（`--apply`） |
 | `scripts/sync-project-hooks.sh` | 手动 | 给各模块仓装 hook + secret（默认逐仓开分支提 PR；`--push` 直写 main 仅适用于无分支保护的仓） |
+
+两条编排口径（都是 2026-10-26 实测踩出来的）：
+
+- **全量同步只由「整点 + 手动」触发**，不再监听 PR/issue 事件。
+  单条入板由「即时入板」按条目号隔离地负责（各仓同款模板也如此），
+  在全量 workflow 里再挂一遍是冗余的；而冗余的代价是它会**把整点同步挤掉**：
+  同一个 concurrency group + `cancel-in-progress` 会取消同组里**排队中**的那次
+  ⇒ 实测 20 小时里 63 次 PR 事件把每小时那次整点同步挤到只剩 2 次
+  ⇒ **兜底通道等于没了**（新 issue/PR 最坏延迟 1 小时以上，而且看不出来的：
+  被取消的排队 run 根本不会出现在 run 列表里）。
+- **整点跑不会掐断手动重建**：同一组里 `cancel-in-progress` 只对
+  `workflow_dispatch` 生效 ⇒ 整点跑遇到在跑的手动重建会**排队等**，
+  而不是把它取消掉（重建 40+ 分钟，被取消就意味着看板停在半空状态）。
 
 同步规则：
 
