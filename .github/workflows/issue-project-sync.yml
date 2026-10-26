@@ -26,7 +26,12 @@ permissions:
 
 concurrency:
   group: issue-project-sync
-  cancel-in-progress: true
+  # **手动触发**（尤其行序重建，40+ 分钟）可以取消同组里在跑的；
+  # 而**整点跑不取消**在跑的 —— 它改为排队等待，跑完再跑。
+  # 2026-10-26 实测：重建被整点跑掐断过一次（看板停在半空状态），
+  # 2026-10-25 实测：重建被「合 PR 触发的同步」掐断过一次。
+  # ⇒ 宁可整点跑晚一点，也不要掐断重建。
+  cancel-in-progress: ${{ github.event_name == 'workflow_dispatch' }}
 
 jobs:
   sync:
