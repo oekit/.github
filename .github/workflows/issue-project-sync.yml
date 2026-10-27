@@ -63,3 +63,13 @@ jobs:
           else
             python3 scripts/sync-projects.py --apply
           fi
+
+      - name: Audit boards (read-only)
+        env:
+          GH_TOKEN: ${{ secrets.OEKIT_PROJECT_TOKEN }}
+          ORG: oekit
+        # 对账器：查四块板子的**行 / 推导列 / 视图配置 / 手工行**是否与真相一致。
+        # 看板的呈现层此前没有任何断言，漂移只能靠人点开看板才发现
+        # （2026-10-27 深查一次就揪出三个问题）⇒ 把对账接进 CI，让漂移当场报出来。
+        # 行序只报 WARN 不判红：Projects 的新行只能追加到板尾，那是预期行为。
+        run: python3 scripts/board_audit.py
