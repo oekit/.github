@@ -23,6 +23,7 @@ Projects v2 不会自动跟进 org 的 issue/PR/tag，本脚本补齐：
 from __future__ import annotations
 
 import argparse
+import ast
 import datetime
 import json
 import time
@@ -807,7 +808,7 @@ def maintain_row_order(
         print(f"  ! 行序漂移：将按 createdAt 倒序重建 {n} 行（dry-run，未写入）")
         return False
     print(f"  ! 行序漂移：按 createdAt 倒序重建 {n} 行")
-    ok, skipped = rebuild_rows(proj["id"], proj["items"], plan)
+    ok, skipped = rebuild_rows(proj["id"], proj["number"], proj["items"], plan)
     print(f"  ✓ 重建完成：{ok} 行重排（跳过 {skipped}）")
     return True
 
@@ -2209,6 +2210,114 @@ def refresh_module(mod: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# 静态自检：内部调用点的参数是否与被调函数签名一致
+# ---------------------------------------------------------------------------
+
+
+def _ast_signature(fn: ast.FunctionDef) -> dict:
+    """把一个函数定义解析成「可校验的签名」。
+
+    要点：
+      - 位置参数 = posonlyargs + args；带默认值的那几个是可选的 ⇒ 分成
+        required_pos（必填）与 pos_names（全部位置参数名）；
+      - 关键字-only 参数（kwonlyargs）单独记，必填的那些不能漏传；
+      - 有 *args / **kwargs ⇒ 传入个数可以不定 ⇒ 相应检查必须放宽。
+    """
+    a = fn.args
+    pos = list(getattr(a, "posonlyargs", [])) + list(a.args)
+    kwonly = list(a.kwonlyargs)
+    return {
+        "pos": [p.arg for p in pos],
+        "required_pos": len(pos) - len(a.defaults),
+        "kwonly": [p.arg for p in kwonly],
+        "required_kwonly": [p.arg for p, d in zip(kwonly, a.kw_defaults) if d is None],
+        "has_vararg": a.vararg is not None,
+        "has_kwarg": a.kwarg is not None,
+    }
+
+
+def _ast_call_errors(call: ast.Call, fname: str, sig: dict) -> list[str]:
+    """单个调用点 × 单个签名 ⇒ 错误清单（空 = 匹配）。"""
+    errs: list[str] = []
+    lineno = call.lineno
+    star_pos = any(isinstance(a, ast.Starred) for a in call.args)  # f(*xs)
+    npos = len(call.args)
+    kws = [k for k in call.keywords if k.arg is not None]
+    has_star_kw = any(k.arg is None for k in call.keywords)  # f(**kw)
+
+    # 1) 位置参数个数。注意：**用关键字传的**位置参数也算数
+    #    （f("x", flag=True) 与 f("x", True) 一样把两个位置参数填满了），
+    #    否则 f(a, b=1) 这类签名会被误判成「少传参数」。
+    filled = npos
+    for k in kws:
+        if k.arg in sig["pos"] and k.arg not in sig["pos"][:npos]:
+            filled += 1
+    if not star_pos:
+        if filled < sig["required_pos"]:
+            errs.append(
+                f"第 {lineno} 行调用 {fname}() 只传了 {filled} 个位置参数，"
+                f"签名至少要 {sig['required_pos']} 个"
+            )
+        elif npos > len(sig["pos"]) and not sig["has_vararg"]:
+            errs.append(
+                f"第 {lineno} 行调用 {fname}() 传了 {npos} 个位置参数，"
+                f"签名最多收 {len(sig['pos'])} 个（无 *args）"
+            )
+
+    # 2) 关键字参数：被调函数没有 **kwargs ⇒ 名字必须对得上、不能重复占位
+    given = {k.arg for k in kws}
+    if not sig["has_kwarg"]:
+        for k in kws:
+            if k.arg not in sig["pos"] and k.arg not in sig["kwonly"]:
+                errs.append(f"第 {lineno} 行调用 {fname}() 传了未知关键字 {k.arg}")
+            if not star_pos and k.arg in sig["pos"][:npos]:
+                errs.append(f"第 {lineno} 行调用 {fname}() 的位置参数与关键字 {k.arg} 重复")
+    if not has_star_kw:
+        for kname in sig["required_kwonly"]:
+            if kname not in given:
+                errs.append(f"第 {lineno} 行调用 {fname}() 缺少必填关键字参数 {kname}")
+    return errs
+
+
+def _ast_call_site_finds(tree: ast.AST) -> list[str]:
+    """扫全文件：所有「本文件内定义函数」的调用点，参数必须与签名对得上。
+
+    为什么要有这道门禁：2026-10-27 实测踩过——改了 rebuild_rows() 的签名、
+    漏改调用点 ⇒ 脚本编译得过、跑到那行才 TypeError；而那行恰好在
+    「重建看板」中间 ⇒ 板面已经删了一半才发现。
+
+    保守优先（宁可漏报不可误报）：
+      - 只看本文件内定义的函数，外部调用一律不管；
+      - 同名多定义（局部遮蔽）时，命中任一签名即算通过；
+      - 调用点用 *args / **kwargs 展开 ⇒ 该部分个数未知，跳过对应检查；
+      - 被调函数带 **kwargs ⇒ 关键字个数不定，不判「多传」。
+    """
+    sigs: dict[str, list[dict]] = {}
+    for n in ast.walk(tree):
+        if isinstance(n, ast.FunctionDef):
+            sigs.setdefault(n.name, []).append(_ast_signature(n))
+
+    out: list[str] = []
+    for n in ast.walk(tree):
+        if not isinstance(n, ast.Call):
+            continue
+        fname = getattr(n.func, "id", "")  # 只管裸函数名调用，方法调用不管
+        if fname not in sigs:
+            continue
+        matched = False
+        last: list[str] = []
+        for sig in sigs[fname]:
+            errs = _ast_call_errors(n, fname, sig)
+            if not errs:
+                matched = True
+                break
+            last = errs
+        if not matched:
+            out.extend(last)
+    return out
+
+
+# ---------------------------------------------------------------------------
 
 
 def selftest() -> int:
@@ -2332,6 +2441,81 @@ def selftest() -> int:
         got = want_issue_status(state, cur)
         if got != want:
             fails.append(f"want_issue_status({state!r}, {cur!r}) = {got!r}，期望 {want!r}")
+
+    # 7) 内部调用点的参数必须与被调函数签名一致（2026-10-27 实测踩过：
+    #    改了 rebuild_rows 的签名、漏改调用点 ⇒ 脚本编译得过、跑到那行才 TypeError，
+    #    而那行恰好是「重建看板」⇒ CI 红了但板面已经删了一半。静态查一遍最省事）。
+    src_text = Path(__file__).read_text(encoding="utf-8")
+    try:
+        tree = ast.parse(src_text)
+    except SyntaxError as exc:
+        fails.append(f"脚本自身语法错误：{exc}")
+    else:
+        for msg in _ast_call_site_finds(tree):
+            fails.append(msg)
+
+    # 8) 检查器自身的判据必须成立——「检查器判据失效必须红」，否则这道门禁只是摆设。
+    #    8a) 判据用例：合法调用不许报错，非法调用必须报错（防检查器被改松/改坏）；
+    #    8b) 文件级反证：把本脚本里 rebuild_rows 的调用点改坏，检查器必须抓住
+    #        （复刻 2026-10-27 那次真实事故：漏改调用点 ⇒ 跑到重建才炸）。
+    probe_defs = '''
+def f(a, b, *, c=1, d):
+    return a
+
+def g(a, b=2, *args, **kw):
+    return a
+
+def h(a, b, **kw):
+    return a
+'''
+    ok_calls = {
+        "f(1, 2, d=3)": "关键字填位置参数 + 必填 kwonly 齐",
+        "f(1, b=2, d=3)": "位置+关键字混填",
+        "g(1, 2, 3, x=4)": "被调函数带 *args/**kwargs",
+        "h(1, 2, x=3)": "被调函数带 **kwargs",
+        "f(*xs, d=1)": "调用点用 *args 展开（个数未知 ⇒ 跳过位置检查）",
+    }
+    bad_calls = {
+        "f(1, 2)": "漏传必填 kwonly",
+        "f(1)": "少传位置参数",
+        "f(1, 2, 3, 4)": "多传位置参数",
+        "f(1, 2, d=3, zz=9)": "未知关键字",
+    }
+    for expr, why in ok_calls.items():
+        try:
+            ptree = ast.parse(probe_defs + "\n" + expr + "\n")
+        except SyntaxError as exc:
+            fails.append(f"判据用例 {expr!r} 本身语法错：{exc}")
+            continue
+        errs = _ast_call_site_finds(ptree)
+        if errs:
+            fails.append(f"判据用例 {expr!r}（{why}）被误报：{errs[0]}")
+    for expr, why in bad_calls.items():
+        try:
+            ptree = ast.parse(probe_defs + "\n" + expr + "\n")
+        except SyntaxError as exc:
+            fails.append(f"判据用例 {expr!r} 本身语法错：{exc}")
+            continue
+        errs = _ast_call_site_finds(ptree)
+        if not errs:
+            fails.append(f"判据用例 {expr!r}（{why}）漏报——检查器判据失效")
+
+    broken_tree = ast.parse(src_text)
+    victim_call = None
+    for n in ast.walk(broken_tree):
+        if isinstance(n, ast.Call) and getattr(n.func, "id", "") == "rebuild_rows":
+            victim_call = n
+            break
+    if victim_call is None:
+        fails.append("反证样本构造失败：脚本里找不到 rebuild_rows 的调用点")
+    else:
+        # 直接在 AST 上删掉一个实参 ⇒ 复刻「改了签名、漏改调用点」的现场
+        victim_call.args.pop(0)
+        berrs = _ast_call_site_finds(broken_tree)
+        if not any("rebuild_rows" in e for e in berrs):
+            fails.append(
+                "反证失败：把 rebuild_rows 调用点改坏后自检没报错——检查器已失效"
+            )
 
     for f in fails:
         print(f"FAIL {f}")
