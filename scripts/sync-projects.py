@@ -352,7 +352,7 @@ def load_project(number: int) -> dict:
         cursor = page.get("endCursor")
         if not cursor:
             break
-    return {"id": pid, "fields": fields, "items": items}
+    return {"id": pid, "number": number, "fields": fields, "items": items}
 
 
 def set_field(pid: str, item_id: str, field_id: str, *, option_id: str | None = None, text: str | None = None, number: float | None = None) -> None:
@@ -657,7 +657,49 @@ def resolve_content_ids(urls: list[str]) -> list[str | None]:
     return out
 
 
-def rebuild_rows(pid: str, board_items: list[dict], plan: list[dict]) -> tuple[int, int]:
+def wait_board_drained(number: int, timeout: int = 900) -> int:
+    """等删行**真正生效**再开始加行。
+
+    Projects 的删行是**异步**的：`deleteProjectV2Item` 立刻返回，行还在板上。
+    不等就重建 ⇒ **迟到的 delete 会把刚加回去的行一起抹掉**
+    （2026-10-27 实测：#4 重建日志写着「1113 行重排（跳过 0）」，几十分钟后
+    却有 2 条 PR + 1 条草稿行在板上消失、行序也悄悄错位 —— 迟到的 delete 干的）。
+
+    ⇒ 删完轮询 `totalCount`，等它真的降下来（趋近 0）再加行。
+    返回等到的最终行数。
+    """
+    deadline = time.time() + timeout
+    last = -1
+    while time.time() < deadline:
+        n = project_item_count(number)
+        if n != last:
+            print(f"  … 等待删行生效：板上还剩 {n} 行")
+            last = n
+        if n <= 0:
+            print("  ✓ 板上已排空，开始按序回填")
+            return 0
+        time.sleep(5)
+    print(f"  ! 等待删行生效超时（板上还剩 {last} 行）——继续回填")
+    return last
+
+
+def project_item_count(number: int) -> int:
+    """板上的行数（一次轻量查询；totalCount 与实际分页数一致 ✓）。"""
+    data = gql(
+        """
+        query($number: Int!) {
+          organization(login: "oekit") {
+            projectV2(number: $number) { items(first: 1) { totalCount } }
+          }
+        }
+        """,
+        number=str(number),
+    )
+    items = data["organization"]["projectV2"]["items"]
+    return int(items.get("totalCount") or 0)
+
+
+def rebuild_rows(pid: str, number: int, board_items: list[dict], plan: list[dict]) -> tuple[int, int]:
     """按 plan 重建看板行：先全删，再按序重加，最后回填推导列。
 
     **必须批量**：串行写一次 Projects 的 mutation ≈ 1.0s（CI 实测），
@@ -675,6 +717,8 @@ def rebuild_rows(pid: str, board_items: list[dict], plan: list[dict]) -> tuple[i
     ]
     for chunk in _chunks(del_fields, BATCH_SIZE):
         gql_batch(chunk)
+    # 删行是异步的 ⇒ 必须等板面真的排空再回填，否则迟到的 delete 会抹掉刚加的行
+    wait_board_drained(number)
 
     drafts = [r for r in plan if r["draft"]]
     rest = [r for r in plan if not r["draft"]]
