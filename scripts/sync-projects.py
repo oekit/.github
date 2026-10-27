@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+import builtins
 import datetime
 import json
 import time
@@ -2273,7 +2274,10 @@ def refresh_module(mod: str) -> None:
             )
 
     # tag 推送 = 一次「近期变更」⇒ 顺手把窗口滚到包含今天
-    sync_pinned_view_filters(True)
+    # 2026-10-27 修：这里原写 sync_pinned_view_filters(True)，而函数在 #32 里
+    # 已改名成 sync_pinned_view_configs ⇒ 跑到这行 NameError ⇒ 全 org 各模块仓
+    # 的「即时入板」job（push / tag 触发的版本大盘刷新）全红。
+    sync_pinned_view_configs(True)
     roll_recent_changes_view(True)
 
     # ---- 矩阵健康 ----
@@ -2310,6 +2314,158 @@ def refresh_module(mod: str) -> None:
     if note_id is not None:
         set_field(hproj["id"], hitem["id"], note_id, text=note)
     print(f"  ✓ health  {want}  install={install or '-'} tag={latest or '-'}")
+
+
+# ---------------------------------------------------------------------------
+# 静态自检：裸名调用引用的名字必须在本文件里绑过
+# ---------------------------------------------------------------------------
+
+
+def _bound_names(stmts: list[ast.stmt], *, deep: bool) -> set[str]:
+    """收集这些语句在**本作用域**里绑定的名字。
+
+    deep 的含义只有一个：**要不要进函数/类体**。
+      - deep=False（模块层）：只收本层的 def/class/赋值/import/for 目标/with-as/
+        except-as/海象 ⇒ 函数体里的名字是局部的，不算模块级绑定；
+      - deep=True（任何位置）：连函数体内部的局部绑定一起收 ⇒ 用于
+        「本文件任何作用域绑过就算合法」这道宽松判据。
+
+    同层复合语句（if/for/while/with/try）的子句**始终**下探——它们与本句
+    处在同一作用域。
+    """
+    out: set[str] = set()
+    for st in stmts:
+        out |= _bound_names_of(st, deep=deep)
+    return out
+
+
+def _bound_names_of(node: ast.AST, *, deep: bool) -> set[str]:
+    out: set[str] = set()
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+        out.add(node.name)
+        if deep:
+            out |= _bound_names(node.body, deep=True)
+            a = node.args
+            for arg in (list(getattr(a, "posonlyargs", [])) + list(a.args)
+                        + list(a.kwonlyargs)):
+                out.add(arg.arg)
+            if a.vararg:
+                out.add(a.vararg.arg)
+            if a.kwarg:
+                out.add(a.kwarg.arg)
+        return out
+    if isinstance(node, ast.Lambda):
+        if deep:
+            a = node.args
+            for arg in (list(getattr(a, "posonlyargs", [])) + list(a.args)
+                        + list(a.kwonlyargs)):
+                out.add(arg.arg)
+            if a.vararg:
+                out.add(a.vararg.arg)
+            if a.kwarg:
+                out.add(a.kwarg.arg)
+        return out
+    if isinstance(node, ast.Import):
+        for al in node.names:
+            out.add((al.asname or al.name).split(".")[0])
+        return out
+    if isinstance(node, ast.ImportFrom):
+        for al in node.names:
+            out.add(al.asname or al.name)
+        return out
+    if isinstance(node, ast.Assign):
+        targets = node.targets
+    elif isinstance(node, (ast.AugAssign, ast.AnnAssign)):
+        targets = [node.target]
+    else:
+        targets = []
+    for t in targets:
+        for x in ast.walk(t):
+            if isinstance(x, ast.Name):
+                out.add(x.id)
+    if isinstance(node, ast.NamedExpr) and isinstance(node.target, ast.Name):
+        out.add(node.target.id)
+    if isinstance(node, (ast.For, ast.AsyncFor)):
+        for x in ast.walk(node.target):
+            if isinstance(x, ast.Name):
+                out.add(x.id)
+        out |= _bound_names(node.body, deep=deep)
+        out |= _bound_names(node.orelse, deep=deep)
+        return out
+    if isinstance(node, (ast.With, ast.AsyncWith)):
+        for item in node.items:
+            if item.optional_vars is not None:
+                for x in ast.walk(item.optional_vars):
+                    if isinstance(x, ast.Name):
+                        out.add(x.id)
+        out |= _bound_names(node.body, deep=deep)
+        return out
+    if isinstance(node, ast.Try):
+        out |= _bound_names(node.body, deep=deep)
+        for h in node.handlers:
+            if h.name:
+                out.add(h.name)
+            out |= _bound_names(h.body, deep=deep)
+        out |= _bound_names(node.orelse, deep=deep)
+        out |= _bound_names(node.finalbody, deep=deep)
+        return out
+    if isinstance(node, ast.ExceptHandler):
+        if node.name:
+            out.add(node.name)
+        out |= _bound_names(node.body, deep=deep)
+        return out
+    if isinstance(node, (ast.Global, ast.Nonlocal)):
+        out.update(node.names)
+        return out
+    if isinstance(node, ast.If):
+        out |= _bound_names(node.body, deep=deep)
+        out |= _bound_names(node.orelse, deep=deep)
+        return out
+    if isinstance(node, ast.While):
+        out |= _bound_names(node.body, deep=deep)
+        out |= _bound_names(node.orelse, deep=deep)
+        return out
+    return out
+
+
+def _ast_undefined_name_finds(tree: ast.AST) -> list[str]:
+    """扫全文件：裸名调用所引用的名字必须在本文件里绑过（或是 builtin）。
+
+    为什么要有这道门禁：2026-10-25 合入的 #32 把 sync_pinned_view_filters
+    改名成 sync_pinned_view_configs，**漏改了一处调用点** ⇒
+    脚本编译得过（py_compile 只查语法）、跑到那行才 NameError；而那行在
+    「刷新版本大盘」路径上 ⇒ **全 org 每个模块仓的「即时入板」job 都在红**
+    （各仓 workflow 都 checkout 本仓 scripts/sync-projects.py 复用）。
+
+    与 _ast_call_site_finds 互补：那道只查「本文件内已定义函数」的参数匹配，
+    对「压根不存在的名字」直接跳过 ⇒ 改名/删除造成的 NameError 整类漏网。
+
+    保守优先（宁可漏报不可误报）——误报会让这道门禁恒红，那是比漏报更坏的结果：
+      - 只管**裸名调用**（obj.method() 不管）；
+      - 名字只要在本文件**任何作用域**被绑过（局部变量也算）就算合法 ⇒
+        局部遮蔽场景一律放过；
+      - builtin 与模块级 import 算合法。
+    """
+    module_bound = _bound_names(tree.body, deep=False)
+    anywhere_bound = _bound_names(tree.body, deep=True)
+    legal = module_bound | anywhere_bound | set(dir(builtins))
+
+    out: list[str] = []
+    for n in ast.walk(tree):
+        if not isinstance(n, ast.Call):
+            continue
+        if not isinstance(n.func, ast.Name):   # 方法调用 / 属性调用不管
+            continue
+        name = n.func.id
+        if name not in legal:
+            out.append(
+                f"第 {n.lineno} 行调用了本文件里不存在的函数 {name}()"
+                "（改名/删除漏改调用点 ⇒ 运行到这行才 NameError）"
+            )
+    return out
+
+
+# ---------------------------------------------------------------------------
 
 
 # ---------------------------------------------------------------------------
@@ -2618,6 +2774,65 @@ def h(a, b, **kw):
         if not any("rebuild_rows" in e for e in berrs):
             fails.append(
                 "反证失败：把 rebuild_rows 调用点改坏后自检没报错——检查器已失效"
+            )
+
+    # 9) 未定义名检查（2026-10-25 实测踩过：#32 把 sync_pinned_view_filters
+    #    改名成 sync_pinned_view_configs、**漏改一处调用点** ⇒ 脚本编译得过、
+    #    跑到那行才 NameError；而那行在「刷新版本大盘」路径上 ⇒ 全 org 每个
+    #    模块仓的「即时入板」job 都红（各仓 workflow 都 checkout 本仓脚本复用）。
+    #    8a/8b 那道只查「本文件内已定义函数」的参数匹配，对「压根不存在的名字」
+    #    直接跳过 ⇒ 改名/删除造成的 NameError 整类漏网，必须另立一道。
+    #    9a) 判据用例：合法调用不许报错、未定义名必须报错（防检查器被改松/改坏）
+    #    9b) 文件级反证：把本脚本里的函数定义改名（复刻 #32 现场），检查器必须抓住
+    undef_ok_probe = """
+import os
+from pathlib import Path
+
+def defined(a):
+    return a
+
+def caller():
+    local = 1
+    return defined(local) + len("x") + len(str(Path(".")))
+"""
+    undef_bad_probe = undef_ok_probe + "\nundefined_thing(1)\n"
+    # 局部遮蔽：名字在别处绑过 ⇒ 按「宁可漏报」放过（这是判据的边界，要钉住）
+    undef_shadow_probe = """
+def f():
+    g = 1
+    return g()
+"""
+    for label, probe, want_err in (
+        ("合法调用", undef_ok_probe, False),
+        ("未定义名", undef_bad_probe, True),
+        ("局部遮蔽（按宽松判据放过）", undef_shadow_probe, False),
+    ):
+        try:
+            ptree = ast.parse(probe)
+        except SyntaxError as exc:
+            fails.append(f"未定义名判据用例 {label!r} 本身语法错：{exc}")
+            continue
+        uerrs = _ast_undefined_name_finds(ptree)
+        if want_err and not uerrs:
+            fails.append(f"未定义名判据用例 {label!r} 漏报——检查器判据失效")
+        if not want_err and uerrs:
+            fails.append(f"未定义名判据用例 {label!r} 被误报：{uerrs[0]}")
+
+    # 9b) 文件级反证：改名一个真实函数定义 ⇒ 其调用点变成未定义名 ⇒ 必须报
+    renamed_tree = ast.parse(src_text)
+    victim_def = None
+    for n in ast.walk(renamed_tree):
+        if isinstance(n, ast.FunctionDef) and n.name == "sync_pinned_view_configs":
+            victim_def = n
+            break
+    if victim_def is None:
+        fails.append("反证样本构造失败：脚本里找不到 sync_pinned_view_configs 的定义")
+    else:
+        victim_def.name = "sync_pinned_view_configs_RENAMED"
+        uerrs = _ast_undefined_name_finds(renamed_tree)
+        if not any("sync_pinned_view_configs" in e for e in uerrs):
+            fails.append(
+                "反证失败：把函数定义改名后未定义名检查没报错——检查器已失效"
             )
 
     for f in fails:
