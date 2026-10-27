@@ -67,6 +67,21 @@ PINNED_VIEWS: dict[int, dict[str, dict]] = {
         "按模块": {"filter": "", "columns": ["Title", "Module", "Status", "Created"]},
         "按类型": {"filter": "", "columns": ["Title", "Kind", "Module", "Created"]},
     },
+    # #2 版本大盘：滚动窗口的「近期变更」只钉列、不钉过滤器
+    # （过滤器由 roll_recent_changes_view() 每天滚动，写死会打架）。
+    PROJECT_VERSION: {
+        "总览": {"filter": "", "columns": ["Title", "Layer", "Latest", "Prior", "Parent", "序号"]},
+        "嵌套模块": {"filter": "parent:*", "columns": ["Title", "Layer", "Latest", "Prior", "Parent", "序号"]},
+        "近期变更": {"columns": ["Title", "Updated", "Layer", "Latest", "Prior"]},
+        "按层级": {"filter": "", "columns": ["Title", "Layer", "Latest", "Prior"]},
+    },
+    PROJECT_HEALTH: {
+        "总览": {"filter": "", "columns": ["Title", "Hygiene", "Drift", "Install", "Tag", "Note", "序号"]},
+        "有漂移": {"filter": 'hygiene:"有漂移"', "columns": ["Title", "Hygiene", "Drift", "Install", "Tag", "Note", "序号"]},
+        "全绿": {"filter": 'hygiene:"全绿"', "columns": ["Title", "Hygiene", "Drift", "Install", "Tag", "序号"]},
+        "待审计": {"filter": 'hygiene:"待审计"', "columns": ["Title", "Hygiene", "Drift", "Install", "Tag", "序号"]},
+        "看板": {"filter": "", "columns": ["Title", "Hygiene", "Drift", "Install", "Tag", "序号"]},
+    },
     PROJECT_PR: {
         "总览": {"filter": "", "columns": ["Title", "Review", "Scope", "Updated"]},
         "待审": {"filter": 'review:"待审"', "columns": ["Title", "Scope", "Updated"]},
@@ -78,6 +93,23 @@ PINNED_VIEWS: dict[int, dict[str, dict]] = {
         "看板": {"filter": "", "columns": ["Title", "Review", "Scope"]},
     },
 }
+
+# #4 板上的 SOP 备注行：**必须由脚本托管**。
+# 它是板上唯一「没有主人」的行——脚本不认它 ⇒ 一旦被删就永远回不来
+# （2026-10-27 实测：行序重建之后这行从板上消失了，脚本不认 ⇒ 没人补得回来）。
+PR_BOARD_NOTE_TITLE = "（SOP）PR 入队：跨仓 PR 请收进本队列"
+PR_BOARD_NOTE_BODY = """跨仓 PR（来自 fork 或别的 org 的仓库）**不会**自动进 org 的大盘同步范围
+（`gh search prs --owner oekit` / 按仓枚举都只认 org 自家仓的 PR），必须手动入队，
+否则各仓 reviewer 看不到，容易漏审。
+
+入队：
+    gh project item-add 4 --owner oekit --url <pr-url>
+
+入队后请确认两列：
+- Review = 待审（审阅中 / 需修改 / 可合入 是**人工流转态**，同步脚本不会覆盖它）
+- Scope  = 按 conventional commit 类型推导（feat / fix / docs / ci / deps …）
+
+详见 CONTRIBUTING.md「进 PR 审查队列」。"""
 
 # 分组的期望值（Group by / Column by）——**只声明、只告警**，写不了。
 # 格式：项目号 -> {视图名: 分组字段名}
@@ -1123,6 +1155,24 @@ def list_org_prs() -> list[dict]:
     return _list_org_all("prs", skip_pull=False)
 
 
+def ensure_pr_board_note(proj: dict) -> None:
+    """确保 #4 板上的 SOP 备注行在。
+
+    这行是**手工行**（Projects 的 draft issue），脚本不认它 ⇒ 丢了就永久没了
+    （2026-10-27 实测：行序重建之后它从板上消失，脚本不会补）。
+    ⇒ 每轮同步检查一次，缺了就重建。
+    位置说明：新建的行只能追加到末尾 ⇒ 想要它在板首，等下次重建（plan 里草稿排最前）。
+    """
+    if any((it.get("title") or "") == PR_BOARD_NOTE_TITLE for it in proj["items"]):
+        return
+    print(f"  + SOP 备注行缺失 ⇒ 重建（{PR_BOARD_NOTE_TITLE}）")
+    try:
+        iid = add_draft(proj["id"], PR_BOARD_NOTE_TITLE, PR_BOARD_NOTE_BODY)
+        print(f"  ✓ SOP 备注行已重建：{iid}")
+    except Exception as exc:
+        print(f"  ! SOP 备注行重建失败：{str(exc)[:200]}")
+
+
 def sync_pr_board(apply: bool, force_reorder: bool = False) -> None:
     print("\n=== #4 PR 审查队列 ===")
     proj = load_project(PROJECT_PR)
@@ -1134,6 +1184,7 @@ def sync_pr_board(apply: bool, force_reorder: bool = False) -> None:
     by_url = {i["url"]: i for i in proj["items"] if i["url"]}
     prs = list_org_prs()
     print(f"org prs={len(prs)} board={len(proj['items'])}")
+    ensure_pr_board_note(proj)
 
     adds: list[dict] = []
     syncs: list[dict] = []
@@ -2207,7 +2258,10 @@ def selftest() -> int:
         for name, want in spec.items():
             for col in want.get("columns", []):
                 if col not in ("Title", "Status", "Kind", "Module", "Created", "Closed",
-                               "Review", "Scope", "Updated"):
+                               "Review", "Scope", "Updated",
+                               # #2 版本大盘 / #3 矩阵健康
+                               "序号", "Layer", "Latest", "Prior", "Parent",
+                               "Hygiene", "Drift", "Install", "Tag", "Note"):
                     fails.append(f"#{number} 视图「{name}」钉了未知列 {col}")
 
     # 6) 人工流转态不许被脚本冲掉（Review / Status 都一样）
