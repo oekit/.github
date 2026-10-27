@@ -71,6 +71,61 @@ Q_ISSUE_ITEMS = """query($owner:String!,$repo:String!,$number:Int!){
   }
 }"""
 
+# 同一条目的 issue / PR **两种类型**都要查：GitHub 里 issue 与 pullRequest
+# 是不同类型，`issue(number:N)` 对 PR 恒为 null ⇒ 只查 issue 会把 PR 判成「读不到」。
+#
+# 用 alias 同时查两种类型，且**忽略类型不匹配带来的 errors**：
+# `issue(number:N)` 对一个 PR 编号是**报错**（"Could not resolve to an Issue"）
+# 而不是返回 null ⇒ 严格版 gql 会把整个查询判失败 ⇒ PR 一条都读不到。
+# 实测 2026-10-27：pkg#102 是 PR，用非 alias 的写法整条查询带 errors ⇒
+# 权威复核全部落进「读不到」分支 ⇒ 对账门禁判红能力被悄悄削弱。
+Q_ITEM_ITEMS = """query($owner:String!,$repo:String!,$number:Int!){
+  repository(owner:$owner,name:$repo){
+    asIssue: issue(number:$number){
+      number
+      url
+      title
+      createdAt
+      state
+      projectItems(first:20){
+        nodes{
+          id
+          project{ id number title }
+          fieldValues(first:20){
+            nodes{
+              ... on ProjectV2ItemFieldSingleSelectValue{
+                name
+                field{ ... on ProjectV2FieldCommon{ name } }
+              }
+            }
+          }
+        }
+      }
+    }
+    asPR: pullRequest(number:$number){
+      number
+      url
+      title
+      createdAt
+      state
+      projectItems(first:20){
+        nodes{
+          id
+          project{ id number title }
+          fieldValues(first:20){
+            nodes{
+              ... on ProjectV2ItemFieldSingleSelectValue{
+                name
+                field{ ... on ProjectV2FieldCommon{ name } }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}"""
+
 
 class BoardReadError(RuntimeError):
     """看板读不到（命令失败 / 返回体不可解析）。
@@ -105,6 +160,37 @@ def gql(query: str, variables: dict) -> dict:
     if "data" not in data:
         raise BoardReadError(f"gh 返回体没有 data 字段：{raw[:200]!r}")
     return data["data"]
+
+
+def gql_tolerant(query: str, variables: dict) -> dict:
+    """跑一次 graphql，**容忍 errors**（只要 data 里有需要的字段就够）。
+
+    为什么需要：`issue(number:N)` 对一个 PR 编号会**报错**而不是返回 null，
+    所以「同时查 issue 和 pullRequest」的查询必然带 errors ⇒ 严格版 gql 会抛。
+    ⇒ 这里只认「data 字段在不在」，errors 忽略；data 整个缺失才算读不到。
+
+    注意：`gh api graphql` 带 errors 时**退出码非 0**，但 stdout 里仍有完整 JSON
+    ⇒ 不能拿 returncode 判失败，只看 stdout 有没有可解析的 data。
+    """
+    cmd = ["gh", "api", "graphql", "-f", "query=" + query]
+    for k, v in variables.items():
+        cmd += ["-F" if isinstance(v, int) and not isinstance(v, bool) else "-f", f"{k}={v}"]
+    p = subprocess.run(cmd, capture_output=True, text=True)
+    raw = (p.stdout or "").strip()
+    if not raw:
+        raise BoardReadError(
+            f"gh 返回空正文（不是「没有条目」，是读不到）：{(p.stderr or '').strip()[:300]}"
+        )
+    try:
+        doc = json.loads(raw)
+    except json.JSONDecodeError as e:
+        raise BoardReadError(f"gh 返回体不可解析：{raw[:200]!r}（{e}）") from e
+    if not isinstance(doc.get("data"), dict):
+        raise BoardReadError(
+            "gh 返回体没有 data 字段："
+            + json.dumps(doc.get("errors"), ensure_ascii=False)[:300]
+        )
+    return doc["data"]
 
 
 def parse_fields(field_values: dict) -> dict:
@@ -155,6 +241,46 @@ def find_on(repo: str, num: int, project_number: int = DEFAULT_PROJECT, owner: s
         if item["project_number"] == project_number:
             return item
     return None
+
+
+def item_project_items(repo: str, num: int, owner: str = ORG) -> list:
+    """读 issue **或 PR** 在所有看板上的条目（权威视角）。
+
+    为什么单列一个：Q_ISSUE_ITEMS 只查 `issue(number:)`，而 GitHub 的
+    issue 与 pullRequest 是**两种不同类型** ⇒ PR 用 issue 查恒为 null。
+    而 PR 队列盘（#4）上的东西全是 PR ⇒ 用 issue 视角查会一片「读不到」。
+    """
+    data = gql_tolerant(Q_ITEM_ITEMS, {"owner": owner, "repo": repo, "number": num})
+    repo_node = data.get("repository") or {}
+    node = repo_node.get("asIssue") or repo_node.get("asPR")
+    if node is None:
+        raise BoardReadError(
+            f"{owner}/{repo}#{num}：既不是 issue 也不是 PR（编号可能不存在）"
+        )
+    out = []
+    for it in ((node.get("projectItems") or {}).get("nodes")) or []:
+        if not isinstance(it, dict):
+            continue
+        proj = it.get("project") or {}
+        out.append({
+            "item_id": it.get("id"),
+            "project_number": proj.get("number"),
+            "project_title": proj.get("title"),
+            "fields": parse_fields(it.get("fieldValues")),
+        })
+    return out
+
+
+def on_board(repo: str, num: int, project_number: int = DEFAULT_PROJECT, owner: str = ORG) -> bool:
+    """该 issue/PR 是否在指定看板上（权威视角）。
+
+    **读不到会抛 BoardReadError 而不是返回 False**——
+    「读不到」与「不在板上」必须分开：前者是判断不了，后者才是事实。
+    """
+    for item in item_project_items(repo, num, owner=owner):
+        if item["project_number"] == project_number:
+            return True
+    return False
 
 
 def describe(repo: str, num: int, project_number: int = DEFAULT_PROJECT) -> str:
@@ -234,6 +360,35 @@ def _fixture_item(item_id: str, project_number: int, fields: dict) -> dict:
             }]},
         }}},
     }
+
+
+def _fixture_item_any(item_id: str, project_number: int, as_pr: bool) -> dict:
+    """构造 alias 版（asIssue / asPR）的 canned 载荷，**并带上真实存在的 errors**。
+
+    为什么带 errors：真实响应里，查 PR 编号时 `asIssue` 字段会报错
+    （"Could not resolve to an Issue with the number of N"），
+    而 `asPR` 仍有完整数据 ⇒ 这才是 gql_tolerant 要处理的形态。
+    fixture 里若没有 errors，用例就测不出「容忍 errors」这件事。
+    """
+    node = {
+        "id": item_id,
+        "project": {"id": "PVT_fake", "number": project_number, "title": "fake board"},
+    }
+    if as_pr:
+        repo = {
+            "asIssue": None,
+            "asPR": {"number": 102, "url": "https://github.com/fake/pkg/pull/102",
+                     "projectItems": {"nodes": [node]}},
+        }
+        errors = [{"message": "Could not resolve to an Issue with the number of 102."}]
+    else:
+        repo = {
+            "asIssue": {"number": 32, "url": "https://github.com/fake/core/issues/32",
+                        "projectItems": {"nodes": [node]}},
+            "asPR": None,
+        }
+        errors = [{"message": "Could not resolve to a PullRequest with the number of 32."}]
+    return {"data": {"repository": repo}, "errors": errors}
 
 
 def _raises_read_error(fn) -> bool:
@@ -360,6 +515,28 @@ def _selftest() -> int:
                 os.remove(log_path)
             case("变量类型：number 用 -F / repo·owner 用 -f",
                  lambda: _flags_case(log_path))
+
+            # 用例 9（PR 读法）：**PR 必须能查**。
+            #      2026-10-27 实测：`issue(number:N)` 对一个 PR 编号是**报错**
+            #      （"Could not resolve to an Issue"）而不是返回 null ⇒
+            #      非 alias 的写法会让整条查询带 errors ⇒ PR 一条都读不到
+            #      ⇒ 权威复核全落进「读不到」分支 ⇒ 对账门禁判红能力被悄悄削弱。
+            #      这条用例守住 alias + 容忍 errors 的写法。
+            os.environ["FAKE_GH_FIXTURES"] = json.dumps({
+                "pkg#102": _fixture_item_any("PVTI_5", 4, as_pr=True),
+                "pkg#103": _fixture_item_any("PVTI_6", 4, as_pr=True),
+                "core#32": _fixture_item_any("PVTI_7", 1, as_pr=False),
+            })
+            case("PR 在板上⇒on_board 为真",
+                 lambda: on_board("pkg", 102, 4) is True)
+            case("PR 不在板上⇒on_board 为假",
+                 lambda: on_board("pkg", 103, 5) is False)
+            case("issue 在板上⇒on_board 为真",
+                 lambda: on_board("core", 32, 1) is True)
+            case("PR 读法：item_project_items 能拿到条目",
+                 lambda: bool(item_project_items("pkg", 102)))
+            case("PR 读法：issue 与 PR 两种类型都能命中",
+                 lambda: (item_project_items("pkg", 102) and item_project_items("core", 32)))
         finally:
             os.environ["PATH"] = old_path
             if old_fixtures is None:
