@@ -17,6 +17,7 @@
 """
 from __future__ import annotations
 
+import datetime
 import importlib.util
 import json
 import os
@@ -38,7 +39,22 @@ def _load_sync_module():
     return mod
 
 
+def _load_bq_module():
+    spec = importlib.util.spec_from_file_location("board_query", HERE / "board_query.py")
+    if spec is None or spec.loader is None:
+        raise SystemExit("加载 board_query.py 失败")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
 SP = _load_sync_module()
+BQ = _load_bq_module()
+
+# 入板传播宽限：刚开的 issue/PR 从「创建」到「即时入板 workflow 把它加到板上」
+# 有延迟（2026-10-27 实测：新 PR 提交后 audit 立刻跑，板上还没有 ⇒ 假红）。
+# ⇒ 宽限期内的缺失只报 WARN，不判红。
+GRACE_SECONDS = 2 * 3600
 ORG = os.environ.get("ORG", "oekit")
 
 BOARDS = {
@@ -163,10 +179,18 @@ def load_board(num: int):
     return proj, fields, views, rows
 
 
+_org_repos_cache: list[str] | None = None
+
+
 def org_repos() -> list[str]:
-    return subprocess.run(
+    """org 的仓列表（缓存：每次调用都是 24 次 REST，而一个 audit 里要用好几次）。"""
+    global _org_repos_cache
+    if _org_repos_cache is not None:
+        return _org_repos_cache
+    _org_repos_cache = subprocess.run(
         ["gh", "api", "--paginate", f"/orgs/{ORG}/repos?per_page=100", "--jq", ".[].full_name"],
         capture_output=True, text=True).stdout.split()
+    return _org_repos_cache
 
 
 def org_items(kind: str) -> list[dict]:
@@ -191,6 +215,75 @@ def org_items(kind: str) -> list[dict]:
     return out
 
 
+def authoritative_on_board(url: str, project_number: int) -> bool | None:
+    """权威复核：这条 issue/PR 到底在不在某块板上。
+
+    返回 True=在板上 / False=确实不在 / None=**读不到**（判断不了）。
+
+    为什么必须有这一步：2026-10-27 实测 —— `projectV2.items` 分页**会漏行**。
+    #4 板实际 1124 行，`projectV2.items` 只返回 1122 行，漏掉的
+    oekit/pkg#102、#82 用 issue 侧 projectItems 查是**在板上的**。
+    ⇒ 拿 `projectV2.items` 当「板上全集」会得出「缺行」的**假阴性**
+    ⇒ CI 的对账门禁会长期假红（红色淹没真信号）。
+    权威视角 = issue/PR 自己的 projectItems（实时），与 board_query.py 同源。
+    """
+    m = re.match(r"https://github\.com/([^/]+)/([^/]+)/(?:issues|pull)/(\d+)", url)
+    if not m:
+        return None
+    owner, repo, num = m.group(1), m.group(2), int(m.group(3))
+    try:
+        return BQ.on_board(repo, num, project_number, owner=owner)
+    except Exception:
+        return None  # 读不到 ≠ 不在板上
+
+
+def classify_missing(
+    missing: list[str],
+    org_by_url: dict,
+    num: int,
+    now: datetime.datetime | None = None,
+    probe=None,
+) -> tuple[list[str], list[str], list[str], list[str]]:
+    """把「疑似缺失」的条目分成四类。
+
+    返回 (真缺, 传播中, 读不到, 读路径漏读)。
+
+    - 真缺        ：权威视角确认不在板上，且已过入板宽限期 ⇒ **判红**
+    - 传播中      ：权威视角确认不在板上，但刚创建 ⇒ 只 WARN
+                    （入板 workflow 还没跑到，不是板子坏了）
+    - 读不到      ：权威视角本身也失败 ⇒ 判断不了 ⇒ 只 WARN（不能当成缺）
+    - 读路径漏读  ：权威视角确认**在板上**，只是 `projectV2.items` 没返回
+                    ⇒ 不是缺行（这条 2026-10-27 实测踩过：#4 板漏读
+                      oekit/pkg#102、#82 ⇒ 旧的差集判定长期假红）
+
+    probe 可注入 ⇒ 判定逻辑能离线自测（判据失效必须红）。
+    """
+    probe = probe or authoritative_on_board
+    now = now or datetime.datetime.now(datetime.timezone.utc)
+    real: list[str] = []
+    grace: list[str] = []
+    unreadable: list[str] = []
+    skipped: list[str] = []
+    for u in sorted(missing):
+        on = probe(u, num)
+        if on is True:
+            skipped.append(u)
+            continue
+        if on is None:
+            unreadable.append(u)
+            continue
+        created = (org_by_url.get(u) or {}).get("createdAt") or ""
+        try:
+            ts = datetime.datetime.fromisoformat(created.replace("Z", "+00:00"))
+        except ValueError:
+            ts = None
+        if ts is not None and (now - ts).total_seconds() < GRACE_SECONDS:
+            grace.append(u)
+        else:
+            real.append(u)
+    return real, grace, unreadable, skipped
+
+
 def check_board(num: int, kind: str | None, label: str) -> tuple[list[str], list[str]]:
     problems: list[str] = []
     warnings: list[str] = []
@@ -201,10 +294,31 @@ def check_board(num: int, kind: str | None, label: str) -> tuple[list[str], list
     if kind:
         org = org_items(kind)
         board_urls = {r["url"] for r in content if r.get("url")}
-        org_urls = {i["url"] for i in org}
-        missing = org_urls - board_urls
-        if missing:
-            problems.append(f"{label}: 缺 {len(missing)} 行（org 有、板上没有），例：{sorted(missing)[:2]}")
+        org_by_url = {i["url"]: i for i in org}
+        org_urls = set(org_by_url)
+        # 差集先按「projectV2.items 漏读」复核，再谈缺行——
+        # 漏读的那几条**在板上**，判缺行就是假红。
+        real_missing, grace, unreadable, skipped = classify_missing(
+            sorted(org_urls - board_urls), org_by_url, num
+        )
+        if real_missing:
+            problems.append(
+                f"{label}: 缺 {len(real_missing)} 行（org 有、板上没有），例：{real_missing[:2]}"
+            )
+        if grace:
+            warnings.append(
+                f"{label}: {len(grace)} 行刚创建、入板还在传播中（宽限 {GRACE_SECONDS // 60} 分钟）"
+                f"⇒ 只警告不判红，例：{grace[:2]}"
+            )
+        if unreadable:
+            warnings.append(
+                f"{label}: {len(unreadable)} 行权威视角也读不到（判断不了），例：{unreadable[:2]}"
+            )
+        if skipped:
+            warnings.append(
+                f"{label}: {len(skipped)} 行 projectV2.items 分页读不到、但权威视角确认在板上"
+                f"（读路径漏读，不算缺行），例：{skipped[:2]}"
+            )
         # 「板上多出的行」只有**仓还在 org 里**的那种才算陈旧（内容已删）；
         # 仓不在 org 里的是跨仓 PR（来自 fork）⇒ 事件驱动入板，属正常 ✓。
         org_repo_set = set(org_repos())
@@ -264,7 +378,68 @@ def check_board(num: int, kind: str | None, label: str) -> tuple[list[str], list
     return problems, warnings
 
 
+def _selftest() -> int:
+    """离线自测：缺行判定必须能分辨四种情况。
+
+    判据失效必须红——否则这道门禁只是摆设（与 board_query.py --selftest 同思路）。
+    纯离线：不触网（probe 全部注入假的）。
+    """
+    now = datetime.datetime(2026, 10, 27, 4, 0, 0, tzinfo=datetime.timezone.utc)
+    old = (now - datetime.timedelta(days=3)).isoformat().replace("+00:00", "Z")
+    fresh = (now - datetime.timedelta(minutes=5)).isoformat().replace("+00:00", "Z")
+    org_by_url = {
+        "https://github.com/oekit/pkg/pull/1": {"createdAt": old},   # 漏读（在板上）
+        "https://github.com/oekit/pkg/pull/2": {"createdAt": old},   # 真缺
+        "https://github.com/oekit/pkg/pull/3": {"createdAt": fresh},  # 传播中
+        "https://github.com/oekit/pkg/pull/4": {"createdAt": old},   # 读不到
+    }
+    u1, u2, u3, u4 = list(org_by_url)
+    fails: list[str] = []
+
+    # 1) 权威视角说「在板上」⇒ 是读路径漏读 ⇒ 不算缺行
+    real, grace, unread, skipped = classify_missing([u1], org_by_url, 4, now=now, probe=lambda u, n: True)
+    if real or grace or unread or skipped != [u1]:
+        fails.append(f"漏读条目被误判：real={real} grace={grace} unread={unread} skipped={skipped}")
+
+    # 2) 权威视角说「不在」+ 老条目 ⇒ 真缺 ⇒ 判红
+    real, grace, unread, skipped = classify_missing([u2], org_by_url, 4, now=now, probe=lambda u, n: False)
+    if real != [u2] or grace or unread or skipped:
+        fails.append(f"真缺没被判红：real={real} grace={grace} unread={unread} skipped={skipped}")
+
+    # 3) 权威视角说「不在」+ 刚创建 ⇒ 入板传播中 ⇒ 只警告
+    real, grace, unread, skipped = classify_missing([u3], org_by_url, 4, now=now, probe=lambda u, n: False)
+    if real or grace != [u3]:
+        fails.append(f"刚创建的缺失被误判成真缺：real={real} grace={grace}")
+
+    # 4) 权威视角也读不到 ⇒ 判断不了 ⇒ 不能当成缺行
+    real, grace, unread, skipped = classify_missing([u4], org_by_url, 4, now=now, probe=lambda u, n: None)
+    if real or unread != [u4]:
+        fails.append(f"读不到的条目被误判成缺行：real={real} unread={unread}")
+
+    # 5) 反证：复核必须真的缩小判红面。
+    #    旧逻辑（拿差集直接当缺行）会把 4 条全判红；复核后只应剩 1 条。
+    probe = lambda u, n: True if u == u1 else (None if u == u4 else False)  # noqa: E731
+    real, grace, unread, skipped = classify_missing(list(org_by_url), org_by_url, 4, now=now, probe=probe)
+    if len(real) != 1 or real != [u2]:
+        fails.append(f"复核没把判红面缩小到唯一真缺：real={real}")
+    if len(skipped) != 1 or len(unread) != 1 or len(grace) != 1:
+        fails.append(f"四类分流不对：real={real} grace={grace} unread={unread} skipped={skipped}")
+
+    # 6) 非法 URL ⇒ 判「读不到」而不是「不在板上」
+    if authoritative_on_board("not-a-url", 4) is not None:
+        fails.append("非法 URL 应当判为「读不到」(None)")
+
+    for f in fails:
+        print(f"FAIL {f}")
+    if fails:
+        return 1
+    print("selftest OK（缺行判定：真缺 / 传播中 / 读不到 / 读路径漏读 四类分流）")
+    return 0
+
+
 def main() -> int:
+    if "--selftest" in sys.argv:
+        return _selftest()
     all_p: list[str] = []
     all_w: list[str] = []
     for num, (kind, label) in BOARDS.items():

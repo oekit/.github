@@ -247,6 +247,100 @@ def parse_github_url(url: str) -> tuple[str, int, str]:
 # ---------------------------------------------------------------------------
 
 
+_BQ = None
+
+
+def _load_board_query():
+    """加载 board_query.py（**权威读路径**：issue/PR 自己的 projectItems）。
+
+    为什么需要它：`projectV2.items` 分页**会漏行**——2026-10-27 实测 #4 板
+    实际 1124 行，它只返回 1122 行（漏掉 oekit/pkg#102、#82，而这两条用
+    issue 侧 projectItems 查是**在板上的**）⇒ 拿它当「板上全集」会把
+    **已在板上的行**当成缺行 ⇒ 每轮同步都去重复添加（"already added"），
+    而且这些行的推导列**永远不会被自愈**（脚本压根不知道它们在板上）。
+    """
+    global _BQ
+    if _BQ is not None:
+        return _BQ
+    import importlib.util
+
+    path = Path(__file__).resolve().parent / "board_query.py"
+    spec = importlib.util.spec_from_file_location("board_query", path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"加载 {path} 失败")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    _BQ = mod
+    return _BQ
+
+
+def authoritative_items(urls: list[str], project_number: int) -> dict[str, dict]:
+    """权威复核：这些条目里，哪些**确实**在某块板上。
+
+    返回 {url: {item_id, fields}}；fields 是 {字段名: 单选值}。
+    """
+    bq = _load_board_query()
+    out: dict[str, dict] = {}
+    for u in urls:
+        m = re.match(r"https://github\.com/([^/]+)/([^/]+)/(?:issues|pull)/(\d+)", u)
+        if not m:
+            continue
+        owner, repo, num = m.group(1), m.group(2), int(m.group(3))
+        try:
+            items = bq.item_project_items(repo, num, owner=owner)
+        except Exception:
+            continue  # 读不到 ≠ 不在板上 ⇒ 跳过，不当成缺行
+        for it in items:
+            if it.get("project_number") != project_number:
+                continue
+            out[u] = {"item_id": it.get("item_id"), "fields": it.get("fields") or {}}
+            break
+    return out
+
+
+def patch_board_by_authoritative(by_url: dict, items: list[dict], project_number: int) -> int:
+    """把「`projectV2.items` 漏读、但权威视角确认在板上」的行补进 by_url。
+
+    补进来的行带 item_id 与单选字段值 ⇒
+      ① 不会被当成「缺行」重复添加（省掉 "already added" 的噪音与无用写）；
+      ② 推导列（Review/Scope/Kind/Module）的漂移**仍然能被自愈**。
+    返回补了几条。
+    """
+    candidates = [it["url"] for it in items if it.get("url") and it["url"] not in by_url]
+    if not candidates:
+        return 0
+    # 复核是逐条发 GraphQL 的 ⇒ 差集太大时别把同步拖垮：
+    # 超量的先告警（漏读面太大本身就是异常，该让人知道），只复核前 N 条。
+    if len(candidates) > AUTHORITATIVE_MAX:
+        print(
+            f"  ! 有 {len(candidates)} 行 projectV2.items 没读到（超出复核上限 "
+            f"{AUTHORITATIVE_MAX}）⇒ 只复核前 {AUTHORITATIVE_MAX} 条，其余按缺行处理",
+            file=sys.stderr,
+        )
+        candidates = candidates[:AUTHORITATIVE_MAX]
+    try:
+        info = authoritative_items(candidates, project_number)
+    except Exception as exc:
+        print(f"  ! 权威复核失败（不阻塞同步）：{str(exc)[:200]}", file=sys.stderr)
+        return 0
+    for url, it in info.items():
+        by_url[url] = {
+            "url": url,
+            "id": it.get("item_id"),
+            "title": "",
+            "created": "",
+            "state": "",
+            "repo": "",
+            "fv": it.get("fields") or {},
+        }
+    if info:
+        print(
+            f"  · 权威复核：{len(info)} 行 projectV2.items 漏读、但确认在板上（已纳入比对，"
+            f"避免重复添加、推导列照常自愈）"
+        )
+    return len(info)
+
+
 def load_project(number: int) -> dict:
     """拉全项目字段与条目（items 游标分页，避免 first:100 静默截断）。"""
     fields: dict[str, dict] = {}
@@ -582,6 +676,9 @@ def _chunks(seq: list, size: int):
 
 # 一次请求塞多少个 mutation。10 是实测的甜点：再大响应体和单请求耗时都上去了。
 BATCH_SIZE = 10
+
+# 权威复核（issue 侧 projectItems）一次复核一条 ⇒ 设个上限，避免漏读面异常大时拖垮同步。
+AUTHORITATIVE_MAX = 50
 
 
 def gql_batch(fields: list[str]) -> tuple[list[dict | None], list[str]]:
@@ -1006,6 +1103,9 @@ def sync_issue_board(apply: bool, force_reorder: bool = False) -> None:
     by_url = {i["url"]: i for i in proj["items"] if i["url"]}
     issues = list_org_issues()
     print(f"org issues={len(issues)} board={len(proj['items'])}")
+    # `projectV2.items` 会漏行 ⇒ 差集先用权威视角复核，避免把「已在板上的行」
+    # 当成缺行（重复添加 + 推导列永远不自愈）
+    patch_board_by_authoritative(by_url, issues, PROJECT_ISSUE)
 
     adds: list[dict] = []
     syncs: list[dict] = []
@@ -1229,6 +1329,9 @@ def sync_pr_board(apply: bool, force_reorder: bool = False) -> None:
     by_url = {i["url"]: i for i in proj["items"] if i["url"]}
     prs = list_org_prs()
     print(f"org prs={len(prs)} board={len(proj['items'])}")
+    # `projectV2.items` 会漏行 ⇒ 差集先用权威视角复核，避免把「已在板上的行」
+    # 当成缺行（重复添加 + 推导列永远不自愈）
+    patch_board_by_authoritative(by_url, prs, PROJECT_PR)
     ensure_pr_board_note(proj)
 
     adds: list[dict] = []
