@@ -23,6 +23,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -97,14 +98,36 @@ query($num: Int!, $cursor: String) {
 
 
 def gql(query: str, num: int, cursor: str | None = None) -> dict:
+    """跑一条 GraphQL 读查询，**重试瞬时故障**，失败时给出可读报错。
+
+    为什么必须重试：2026-10-27 实测本地跑对账器时，GitHub 那边直接回了个
+    EOF（stdout 空、gh 报 stderr）⇒ 旧实现 json.loads('') 抛裸栈 ⇒
+    CI 的「对账」步骤会因一次网络抖动整体崩掉，日志里还看不出是哪块板子。
+    同步脚本那边早有 _graphql_raw_retry（2026-10-26 加的），对账器这边漏了。
+    """
     cmd = ["gh", "api", "graphql", "-f", f"query={query}", "-F", f"num={num}"]
     if cursor:
         cmd += ["-F", f"cursor={cursor}"]
-    out = subprocess.run(cmd, capture_output=True, text=True).stdout
-    doc = json.loads(out)
-    if "errors" in doc:
-        raise SystemExit(f"GraphQL 报错：{json.dumps(doc['errors'], ensure_ascii=False)[:400]}")
-    return doc["data"]["organization"]["projectV2"]
+    last = ""
+    for i in range(3):
+        p = subprocess.run(cmd, capture_output=True, text=True)
+        out = (p.stdout or "").strip()
+        try:
+            doc = json.loads(out)
+        except Exception:
+            last = (
+                f"响应不是 JSON（exit {p.returncode}）："
+                f"stdout={out[:120]!r} stderr={(p.stderr or '').strip()[:200]!r}"
+            )
+        else:
+            if "errors" in doc:
+                raise SystemExit(
+                    f"GraphQL 报错：{json.dumps(doc['errors'], ensure_ascii=False)[:400]}"
+                )
+            return doc["data"]["organization"]["projectV2"]
+        if i + 1 < 3:
+            time.sleep(2 * (i + 1))
+    raise SystemExit(f"GraphQL 重试 3 次仍失败（板 #{num}）：{last}")
 
 
 def load_board(num: int):
