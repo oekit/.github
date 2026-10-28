@@ -52,6 +52,11 @@ on:
         required: false
         type: boolean
         default: true
+      cgo-free-test:
+        description: '是否跑免 CGO 档测试（CGO_ENABLED=0）——默认开启；确实需要 CGO 的库显式关闭并写明理由'
+        required: false
+        type: boolean
+        default: true
 
 # 同一 ref 的重复触发取消旧 run（PR 连推 / main 连推不堆叠分钟数）
 concurrency:
@@ -230,6 +235,47 @@ jobs:
 
       - name: Run tests
         run: ${{ inputs.test-script }}
+
+      # 免 CGO 档：库的测试必须在 CGO_ENABLED=0 下也能跑通。
+      #
+      # 为什么要有这一档：库的**消费方**（NAS 套件 / 容器镜像 / 静态二进制）
+      # 恰恰要求 CGO_ENABLED=0 ⇒ 若库的测试依赖 CGO 驱动，那就是
+      # 「**消费方能构建的环境，库自己却不可测**」——而默认档位只在带 CGO 的
+      # ubuntu 上跑 ⇒ 这类缺陷对整个矩阵**不可见**。
+      #
+      # 实测实例（oekit/gormx，2026-10-28）：gormx 把 CGO 驱动
+      # gorm.io/driver/sqlite（包装 mattn/go-sqlite3）列为直接依赖（生产代码
+      # 零使用，只在测试里）⇒ CGO_ENABLED=0 go test ./... 有 98 个用例失败
+      # （"go-sqlite3 requires cgo to work. This is a stub"）⇒ CI 全程绿灯。
+      #
+      # 注意：**不能用 -race**（竞态检测器本身需要 cgo）⇒ 这一档只跑功能测试。
+      # 默认开启；确实需要 CGO 的库显式关掉并在仓内写明理由。
+      - name: Test without CGO（免 CGO 档）
+        if: inputs.cgo-free-test
+        run: |
+          set -euo pipefail
+          echo "::group::CGO_ENABLED=0 go test（根模块）"
+          CGO_ENABLED=0 go test -count=1 ./...
+          echo "::endgroup::"
+          # 嵌套子模块是独立 module ⇒ 根模块的 ./... 覆盖不到 ⇒ 一并跑。
+          # 工具链取子模块自己 go.mod 声明的版本（与下面的 nested 步骤同口径）。
+          while IFS= read -r mod; do
+            dir=$(dirname "$mod")
+            [ "$dir" = "." ] && continue
+            case "$dir" in
+              ./vendor/*|./third_party/*|./testdata/*|./examples/*|./.git/*) continue ;;
+            esac
+            tc=$(awk '/^go [0-9]/{print $2; exit}' "$mod")
+            case "$tc" in
+              *.*.*) : ;;
+              *.*)   tc="$tc.0" ;;
+              *)     tc="" ;;
+            esac
+            [ -n "$tc" ] && tc="go$tc" || tc="local"
+            echo "::group::免 CGO ${dir#./} (${tc})"
+            (cd "$dir" && GOTOOLCHAIN="$tc" CGO_ENABLED=0 go test -count=1 ./...)
+            echo "::endgroup::"
+          done < <(find . -name go.mod -not -path './.git/*' | sort)
 
       - name: Test nested modules
         if: inputs.test-nested
