@@ -215,6 +215,199 @@ def org_items(kind: str) -> list[dict]:
     return out
 
 
+def _num_eq(v, want: float) -> bool:
+    try:
+        return abs(float(v) - want) < 1e-6
+    except (TypeError, ValueError):
+        return False
+
+
+def check_version_structure(rows: list[dict]) -> tuple[list[str], list[str]]:
+    """#2 版本大盘的**结构**列：行集合 / Parent / Layer / 序号。
+
+    为什么单独拎出来：此前 #2/#3 **完全没有列值断言**（对账器只查 #1/#4 的
+    推导列）⇒ 真相源加了模块、Layer 改了归属、位次重排，板面能一直错着没人知道。
+
+    纯本地（只读 matrix.py 真相源，不触网）⇒ 可离线自测。
+    """
+    problems: list[str] = []
+    modules, nested, _src = SP.load_truth()
+    by_title = {r["title"]: r for r in rows if r.get("title")}
+    want_titles = list(modules) + [f"{mod}/{path}" for mod, path in nested]
+    missing = [t for t in want_titles if t not in by_title]
+    extra = [t for t in by_title if t not in want_titles]
+    if missing:
+        problems.append(f"#2 版本大盘: 缺 {len(missing)} 行（真相源有、板上没有），例：{missing[:3]}")
+    if extra:
+        problems.append(f"#2 版本大盘: 多 {len(extra)} 行（板上多出，真相源已无），例：{extra[:3]}")
+    nested_by_repo: dict[str, list[str]] = {}
+    for repo, path in nested:
+        nested_by_repo.setdefault(repo, []).append(path)
+    for idx, mod in enumerate(modules):
+        want_layer = SP.LAYER_BY_MODULE.get(mod)
+        item = by_title.get(mod)
+        if item:
+            fv = item["fv"]
+            if (fv.get("Parent") or "") != "":
+                problems.append(f"#2: {mod} 的 Parent 应为空，板上 {fv.get('Parent')!r}")
+            if want_layer and (fv.get("Layer") or "") != want_layer:
+                problems.append(f"#2: {mod} 的 Layer 板上 {fv.get('Layer')!r}，应为 {want_layer!r}")
+            if not _num_eq(fv.get("序号"), float(idx * 10)):
+                problems.append(f"#2: {mod} 的序号板上 {fv.get('序号')!r}，应为 {idx * 10}")
+        for j, path in enumerate(nested_by_repo.get(mod, [])):
+            title = f"{mod}/{path}"
+            nitem = by_title.get(title)
+            if not nitem:
+                continue
+            fv = nitem["fv"]
+            if (fv.get("Parent") or "") != mod:
+                problems.append(f"#2: {title} 的 Parent 板上 {fv.get('Parent')!r}，应为 {mod!r}")
+            if want_layer and (fv.get("Layer") or "") != want_layer:
+                problems.append(f"#2: {title} 的 Layer 板上 {fv.get('Layer')!r}，应为 {want_layer!r}")
+            if not _num_eq(fv.get("序号"), float(idx * 10 + j + 1)):
+                problems.append(
+                    f"#2: {title} 的序号板上 {fv.get('序号')!r}，应为 {idx * 10 + j + 1}"
+                )
+    return problems, []
+
+
+def check_health_structure(rows: list[dict]) -> tuple[list[str], list[str]]:
+    """#3 矩阵健康的结构：行集合 / 序号（纯本地）。"""
+    problems: list[str] = []
+    modules, _nested, _src = SP.load_truth()
+    by_title = {r["title"]: r for r in rows if r.get("title")}
+    missing = [m for m in modules if m not in by_title]
+    extra = [t for t in by_title if t not in modules]
+    if missing:
+        problems.append(f"#3 矩阵健康: 缺 {len(missing)} 行（真相源有、板上没有），例：{missing[:3]}")
+    if extra:
+        problems.append(f"#3 矩阵健康: 多 {len(extra)} 行（板上多出），例：{extra[:3]}")
+    for idx, mod in enumerate(modules):
+        item = by_title.get(mod)
+        if not item:
+            continue
+        if not _num_eq(item["fv"].get("序号"), float(idx * 10)):
+            problems.append(
+                f"#3: {mod} 的序号板上 {item['fv'].get('序号')!r}，应为 {idx * 10}"
+            )
+    return problems, []
+
+
+_tags_cache: dict[str, tuple[list[str], dict[str, list[str]]]] = {}
+
+
+def _repo_tags(repo: str) -> tuple[list[str], dict[str, list[str]]]:
+    """一个仓的根 tag 与嵌套 tag（**一次请求**，取数口径与 sync-projects.py 一致）。
+
+    口径必须与同步脚本完全一致（同一 API、同一顺序、同一过滤），
+    否则 audit 会把「同步脚本本来就认为对的东西」判成错。
+    """
+    if repo in _tags_cache:
+        return _tags_cache[repo]
+    cmd = ["gh", "api", f"repos/{ORG}/{repo}/tags?per_page=100", "--jq", "[.[].name]"]
+    p = subprocess.run(cmd, capture_output=True, text=True)
+    try:
+        names = json.loads(p.stdout or "[]")
+    except json.JSONDecodeError:
+        names = []
+    root = [t for t in names if re.fullmatch(r"v\d+\.\d+\.\d+", t)]
+    nested: dict[str, list[str]] = {}
+    for t in names:
+        parsed = SP.parse_nested_tag(t)
+        if parsed:
+            nested.setdefault(parsed[0], []).append(parsed[1])
+
+    def key(v: str) -> tuple[int, ...]:
+        return tuple(int(x) for x in v.lstrip("v").split("."))
+
+    for v in nested.values():
+        v.sort(key=key, reverse=True)
+    _tags_cache[repo] = (root, nested)
+    return _tags_cache[repo]
+
+
+def check_version_tags(rows: list[dict]) -> tuple[list[str], list[str]]:
+    """#2 的 Latest/Prior vs 远端 tag（**只警告**）。
+
+    为什么只警告：发了新 tag 而整点同步还没跑 ⇒ 是**时间差**不是板子坏了
+    ⇒ 判红会让门禁在每次发版后必然红一轮。结构性错误（行集合/Parent/Layer/
+    序号）才判红。
+    """
+    warnings: list[str] = []
+    modules, nested, _src = SP.load_truth()
+    by_title = {r["title"]: r for r in rows if r.get("title")}
+    for mod in modules:
+        item = by_title.get(mod)
+        if not item:
+            continue
+        root, _ = _repo_tags(mod)
+        want_l = root[0] if root else ""
+        want_p = root[1] if len(root) > 1 else ""
+        fv = item["fv"]
+        if (fv.get("Latest") or "") != want_l or (fv.get("Prior") or "") != want_p:
+            warnings.append(
+                f"#2: {mod} 的 Latest/Prior 板上 {fv.get('Latest')!r}/{fv.get('Prior')!r}，"
+                f"远端最新 {want_l!r}/{want_p!r}（可能刚发版、同步未跑）"
+            )
+    nested_by_repo: dict[str, list[str]] = {}
+    for repo, path in nested:
+        nested_by_repo.setdefault(repo, []).append(path)
+    for mod, paths in nested_by_repo.items():
+        _root, nested_map = _repo_tags(mod)
+        for path in paths:
+            title = f"{mod}/{path}"
+            item = by_title.get(title)
+            if not item:
+                continue
+            vers = nested_map.get(path, [])
+            want_l = vers[0] if vers else ""
+            want_p = vers[1] if len(vers) > 1 else ""
+            fv = item["fv"]
+            if (fv.get("Latest") or "") != want_l or (fv.get("Prior") or "") != want_p:
+                warnings.append(
+                    f"#2: {title} 的 Latest/Prior 板上 {fv.get('Latest')!r}/{fv.get('Prior')!r}，"
+                    f"远端最新 {want_l!r}/{want_p!r}"
+                )
+    return [], warnings
+
+
+def check_health_values(rows: list[dict]) -> tuple[list[str], list[str]]:
+    """#3 的 Tag/Install/Hygiene/Drift vs 远端事实（**只警告**，口径同 sync）。"""
+    warnings: list[str] = []
+    modules, _nested, _src = SP.load_truth()
+    by_title = {r["title"]: r for r in rows if r.get("title")}
+    for mod in modules:
+        item = by_title.get(mod)
+        if not item:
+            continue
+        root, _ = _repo_tags(mod)
+        want_tag = root[0] if root else ""
+        try:
+            install = SP.remote_install_line(mod) or ""
+        except Exception:
+            install = ""
+        if not want_tag and not install:
+            want_h, want_d = "待审计", 0.0
+        elif want_tag and not install:
+            want_h, want_d = "待审计", 0.0
+        elif want_tag and install != want_tag:
+            want_h, want_d = "有漂移", 1.0
+        else:
+            want_h, want_d = "全绿", 0.0
+        fv = item["fv"]
+        if (fv.get("Tag") or "") != want_tag or (fv.get("Install") or "") != install:
+            warnings.append(
+                f"#3: {mod} 的 Tag/Install 板上 {fv.get('Tag')!r}/{fv.get('Install')!r}，"
+                f"远端 {want_tag!r}/{install!r}"
+            )
+        if (fv.get("Hygiene") or "") != want_h or not _num_eq(fv.get("Drift"), want_d):
+            warnings.append(
+                f"#3: {mod} 的 Hygiene/Drift 板上 {fv.get('Hygiene')!r}/{fv.get('Drift')!r}，"
+                f"应为 {want_h!r}/{want_d:g}"
+            )
+    return [], warnings
+
+
 def authoritative_on_board(url: str, project_number: int) -> bool | None:
     """权威复核：这条 issue/PR 到底在不在某块板上。
 
@@ -375,6 +568,23 @@ def check_board(num: int, kind: str | None, label: str) -> tuple[list[str], list
             f"{label}: 行序有 {len(breaks)} 处断点（板尾 {len(tail)} 行是重建之后新加入的 ⇒ 预期行为）；"
             f"末行：{[r['title'][:28] for r in tail]}"
         )
+
+    # 6) #2/#3 的结构列与远端事实——此前**完全没有断言**
+    #    （行集合 / Parent / Layer / 序号 判红；Latest/Prior、Tag/Install 判黄）
+    #    注意：#2/#3 的行全是**草稿行**（用 add_draft 建），所以要用全部 rows，
+    #    不能用上面那个排除 DRAFT_ISSUE 的 content。
+    if num == 2:
+        p, w = check_version_structure(rows)
+        problems += p
+        warnings += w
+        _, w2 = check_version_tags(rows)
+        warnings += w2
+    if num == 3:
+        p, w = check_health_structure(rows)
+        problems += p
+        warnings += w
+        _, w2 = check_health_values(rows)
+        warnings += w2
     return problems, warnings
 
 
@@ -428,6 +638,56 @@ def _selftest() -> int:
     # 6) 非法 URL ⇒ 判「读不到」而不是「不在板上」
     if authoritative_on_board("not-a-url", 4) is not None:
         fails.append("非法 URL 应当判为「读不到」(None)")
+
+    # 7) #2/#3 的结构判定（纯本地：只读 matrix.py 真相源，不触网）
+    #    此前 #2/#3 完全没有断言 ⇒ 这些判据一旦失效必须红。
+    modules, nested, _src = SP.load_truth()
+    nested_by_repo: dict[str, list[str]] = {}
+    for repo, path in nested:
+        nested_by_repo.setdefault(repo, []).append(path)
+
+    def _fake_version_rows() -> list[dict]:
+        rows = []
+        for idx, mod in enumerate(modules):
+            layer = SP.LAYER_BY_MODULE.get(mod, "")
+            rows.append({"title": mod, "fv": {"Parent": "", "Layer": layer,
+                                             "序号": float(idx * 10)}})
+            for j, path in enumerate(nested_by_repo.get(mod, [])):
+                rows.append({"title": f"{mod}/{path}",
+                             "fv": {"Parent": mod, "Layer": layer,
+                                    "序号": float(idx * 10 + j + 1)}})
+        return rows
+
+    rows = _fake_version_rows()
+    p, _w = check_version_structure(rows)
+    if p:
+        fails.append(f"正确的 #2 行集合被判有问题：{p[:2]}")
+    p, _w = check_version_structure(rows[:-1])
+    if not any("缺" in x for x in p):
+        fails.append(f"#2 删掉一行后没报缺行：{p[:2]}")
+    bad_parent = [dict(r, fv=dict(r["fv"])) for r in rows]
+    bad_parent[0]["fv"]["Parent"] = "错"
+    p, _w = check_version_structure(bad_parent)
+    if not any("Parent" in x for x in p):
+        fails.append("#2 Parent 改错没被报出来")
+    bad_order = [dict(r, fv=dict(r["fv"])) for r in rows]
+    bad_order[0]["fv"]["序号"] = 999.0
+    p, _w = check_version_structure(bad_order)
+    if not any("序号" in x for x in p):
+        fails.append("#2 序号改错没被报出来")
+
+    hrows = [{"title": m, "fv": {"序号": float(i * 10)}} for i, m in enumerate(modules)]
+    p, _w = check_health_structure(hrows)
+    if p:
+        fails.append(f"正确的 #3 行集合被判有问题：{p[:2]}")
+    p, _w = check_health_structure(hrows[:-1])
+    if not any("缺" in x for x in p):
+        fails.append(f"#3 删掉一行后没报缺行：{p[:2]}")
+    bad_h = [dict(r, fv=dict(r["fv"])) for r in hrows]
+    bad_h[0]["fv"]["序号"] = 999.0
+    p, _w = check_health_structure(bad_h)
+    if not any("序号" in x for x in p):
+        fails.append("#3 序号改错没被报出来")
 
     for f in fails:
         print(f"FAIL {f}")
