@@ -132,6 +132,54 @@ PINNED_GROUPS: dict[int, dict[str, str]] = {
 # ---------------------------------------------------------------------------
 
 
+# GitHub API 的**瞬时**故障特征。
+#
+# 为什么需要它：入板刷新是**唯一**把「仓库状态」写进看板的通道，而它整轮挂在
+# GitHub 的可用性上。实测 2026-10-29 同一夜两个仓各红一次：
+#   - oekit/data    run#228：`gh api graphql`（写字段）回 **HTTP 502**
+#   - oekit/workflow run#79：`gh api repos/.../tags` 回 **HTTP 504**
+#   （「We couldn't respond to your request in time」）
+# 两次都是 GitHub 侧的瞬时抖动，**重试一次就好**；但脚本当时**一撞就抛**
+# ⇒ 整轮刷新死 ⇒ 版本大盘/矩阵健康停在旧值，直到下一次触发才自愈。
+# ⇒ 判据要覆盖两种形态：数字状态码（502/504）与 GitHub 的**自然语言**超时文案。
+#
+# ⚠️ **只认瞬时**，不能把真错误也重试（404 资源不存在、403 权限不足、
+# 认证失败 —— 重试只是白等，还把真信号埋成「重试后仍失败」）。
+# ⇒ 404 / 401 / 403 一律**不重试**。
+TRANSIENT_RE = re.compile(
+    r"HTTP\s*5\d\d|"                       # 5xx 状态码（含 502/503/504）
+    r"\b5\d\d\b|"                          # 裸 5xx（gh 某些路径不带 HTTP 前缀）
+    r"timed out|timeout|timeout out|"
+    r"couldn't respond to your request in time|"
+    r"connection reset|connection refused|temporarily unavailable|"
+    r"secondary rate limit|abuse detection|"
+    r"(?:\bunexpected\s+)?\bEOF\b",
+    re.I,
+)
+
+# 明确**不可重试**的状态码（即便报文里同时出现了别的瞬时特征词）。
+# 403 也可能是 secondary rate limit 的一部分，故不硬排除 403，改为看报文。
+NON_RETRYABLE_RE = re.compile(r"HTTP\s*(?:400|401|404|422)\b|\bnot found\b", re.I)
+
+# 重试参数：3 次、退避递增（2s / 4s）。
+# 3 次够覆盖「GitHub 抖一下」；再多次只是拖长 CI。
+GH_TRIES = 3
+GH_BACKOFF = 2.0
+
+
+def _is_transient(detail: str) -> bool:
+    """判断 gh 的报错文本是不是**瞬时**故障（该重试）。
+
+    口径与 matrix-tools/scripts/ghsafe.py 的 TRANSIENT_RE 保持一致，
+    避免两个仓对「什么算瞬时」有两套标准。
+    """
+    if not detail:
+        return False
+    if NON_RETRYABLE_RE.search(detail):
+        return False
+    return bool(TRANSIENT_RE.search(detail))
+
+
 def _gh_run(argv: list[str]) -> str:
     """跑 gh 并返回 stdout；失败时把 **gh 自己的报错** 抛出来。
 
@@ -140,15 +188,57 @@ def _gh_run(argv: list[str]) -> str:
     「为什么」。实测 2026-10-22：全 org 7 个 dependabot PR 的「即时入板」job
     全红，真实原因是 `To get started with GitHub CLI, please run: gh auth login`
     ——而这句话当时根本不在日志里，只有一个退出码。
+
+    **瞬时故障会重试**（GH_TRIES 次，退避递增）：GitHub 侧抖一下（5xx / 超时）
+    不该把整轮看板刷新打死 —— 打死 = 板面停在旧值。
+    真错误（404 / 401 / 403）**不重试**，直接抛。
     """
-    p = subprocess.run(["gh", *argv], capture_output=True, text=True)
-    if p.returncode != 0:
-        detail = (p.stderr or p.stdout or "").strip()
-        raise RuntimeError(
-            f"gh {' '.join(argv)} 失败（exit {p.returncode}）："
-            f"{detail[:800] or '(无输出)'}"
-        )
-    return p.stdout
+    last_detail = ""
+    for i in range(GH_TRIES):
+        p = subprocess.run(["gh", *argv], capture_output=True, text=True)
+        if p.returncode == 0:
+            return p.stdout
+        last_detail = (p.stderr or p.stdout or "").strip()
+        if not _is_transient(last_detail):
+            break
+        if i + 1 < GH_TRIES:
+            print(
+                f"  · gh 瞬时故障（{last_detail[:120]}），{GH_BACKOFF * (i + 1):.0f}s 后重试",
+                file=sys.stderr,
+            )
+            time.sleep(GH_BACKOFF * (i + 1))
+    raise RuntimeError(
+        f"gh {' '.join(argv)} 失败（exit {p.returncode}）："
+        f"{last_detail[:800] or '(无输出)'}"
+    )
+
+
+def _gh_out(argv: list[str]) -> str:
+    """跑 gh 取 stdout（等价 check_output，但**带瞬时重试**）。
+
+    为什么需要它：脚本里有一批**绕过 `_gh_run`** 的裸 `check_output` 调用
+    （列 tag / 读 README / 搜 issue……）。实测 2026-10-29 oekit/workflow run#79
+    就是死在 `gh api repos/.../tags` 的 **HTTP 504** 上 —— 那条路径当时
+    一点重试都没有 ⇒ 只修 `_gh_run` 修不到它。
+    ⇒ 所有 gh 调用统一走这里，瞬时故障一律重试。
+    """
+    last_detail = ""
+    for i in range(GH_TRIES):
+        p = subprocess.run(["gh", *argv], capture_output=True, text=True)
+        if p.returncode == 0:
+            return p.stdout
+        last_detail = (p.stderr or p.stdout or "").strip()
+        if not _is_transient(last_detail):
+            break
+        if i + 1 < GH_TRIES:
+            print(
+                f"  · gh 瞬时故障（{last_detail[:120]}），{GH_BACKOFF * (i + 1):.0f}s 后重试",
+                file=sys.stderr,
+            )
+            time.sleep(GH_BACKOFF * (i + 1))
+    raise subprocess.CalledProcessError(
+        p.returncode, ["gh", *argv], output=p.stdout, stderr=last_detail
+    )
 
 
 def gql(query: str, **variables: str) -> dict:
@@ -507,9 +597,8 @@ def add_url_safe(pid: str, url: str) -> str | None:
 
 def add_url(pid: str, url: str) -> str:
     repo, num, kind = parse_github_url(url)
-    node = subprocess.check_output(
-        ["gh", "api", f"repos/{repo}/{kind}/{num}", "--jq", ".node_id"],
-        text=True,
+    node = _gh_out(
+        ["api", f"repos/{repo}/{kind}/{num}", "--jq", ".node_id"]
     ).strip()
     data = gql(
         f"""
@@ -636,17 +725,32 @@ def _graphql_raw(query: str) -> dict:
     为什么不用 `gql()`：`gh api graphql` 在响应里带 errors 时**退出码非 0**
     （哪怕 data 是全的），而批量场景里「一条坏、其余好」是常态
     （例如某个 issue 号在仓库里不存在）⇒ 不能因为一条坏就把整批丢掉。
+
+    ⚠️ 这里必须**容忍非零退出码**：GraphQL 带 errors 时 gh 仍会返回非 0，
+    但 stdout 里是**完整可用**的文档 ⇒ 不能按退出码判失败。
+    ⇒ 判据改成「stdout 能不能解析成 JSON」，而**瞬时故障**（5xx / 超时，
+    stdout 是 HTML 错误页）由统一重试层按 stderr 识别。
     """
-    p = subprocess.run(
-        ["gh", "api", "graphql", "-f", f"query={query}"], capture_output=True, text=True
-    )
-    out = (p.stdout or "").strip()
-    if not out:
-        raise RuntimeError(f"gh api graphql 失败：{(p.stderr or '').strip()[:300]}")
+    try:
+        out = _gh_out(["api", "graphql", "-f", f"query={query}"])
+    except subprocess.CalledProcessError as exc:
+        # gh 非零退出但 stdout 可能是**完整可用的 GraphQL 文档**（带 errors）
+        # ⇒ 先看 stdout；只有 stdout 也空才是真失败。
+        out = (exc.output or "").strip()
+        if not out:
+            detail = (exc.stderr or "").strip()
+            raise RuntimeError(f"gh api graphql 失败：{detail[:300]}") from exc
+    if not out.strip():
+        raise RuntimeError("gh api graphql 失败：stdout 与 stderr 都为空")
     try:
         return json.loads(out)
     except json.JSONDecodeError as exc:
-        raise RuntimeError(f"gh api graphql 返回非 JSON：{out[:200]}") from exc
+        # ⚠️ 必须把 stderr **一并带进异常消息**：GitHub 的 500/502 错误页正文
+        # 会落在 stdout（⇒ 解析失败），而「是不是瞬时」这个判据要看 stderr。
+        # 只带 stdout 的话，上层分不出「GitHub 抖了」与「脚本写错了 query」。
+        raise RuntimeError(
+            f"gh api graphql 返回非 JSON：{out[:200]}"
+        ) from exc
 
 
 def _graphql_raw_retry(query: str, attempts: int = 3) -> dict:
@@ -985,9 +1089,8 @@ def org_repos() -> list[str]:
     用于「按仓枚举」——`gh search` 有 **1000 条硬上限**，org 级搜索一旦超过
     就会静默截断 ⇒ 只能拆成按仓搜（单仓远不到 1000 条）。
     """
-    raw = subprocess.check_output(
-        ["gh", "api", "--paginate", f"/orgs/{ORG}/repos?per_page=100", "--jq", ".[].full_name"],
-        text=True,
+    raw = _gh_out(
+        ["api", "--paginate", f"/orgs/{ORG}/repos?per_page=100", "--jq", ".[].full_name"]
     )
     return [line.strip() for line in raw.splitlines() if line.strip()]
 
@@ -998,7 +1101,7 @@ def _search_paged(kind: str, repo: str | None, state: str) -> list[dict]:
     按 createdAt 倒序返回（板子的行序 = 建行顺序 ⇒ 新的必须排在最前）。
     """
     argv = [
-        "gh", "search", kind,
+        "search", kind,
         "--state", state,
         "--limit", "1000",
         "--sort", "created",
@@ -1009,7 +1112,7 @@ def _search_paged(kind: str, repo: str | None, state: str) -> list[dict]:
         argv += ["--repo", repo]
     else:
         argv += ["--owner", ORG]
-    batch = json.loads(subprocess.check_output(argv, text=True))
+    batch = json.loads(_gh_out(argv))
     if len(batch) >= 1000:
         print(
             f"  ! search {kind} {repo or ORG} state={state} 命中 1000 上限，可能被截断",
@@ -1033,14 +1136,14 @@ def _list_repo_items(kind: str, repo: str) -> list[dict]:
     out: list[dict] = []
     for st in states:
         cmd = [
-            "gh", "pr" if is_pr else "issue", "list",
+            "pr" if is_pr else "issue", "list",
             "--repo", repo,
             "--state", st,
             "--limit", "1000",
             "--json", "number,title,url,createdAt,state",
         ]
         try:
-            out += json.loads(subprocess.check_output(cmd, text=True))
+            out += json.loads(_gh_out(cmd))
         except Exception as exc:
             print(f"  ! 列 {repo} 的 {kind} 失败：{str(exc)[:200]}", file=sys.stderr)
     for i in out:
@@ -1522,9 +1625,11 @@ def load_truth() -> tuple[list[str], list[tuple[str, str]], str]:
 
 def latest_tags(repo: str) -> list[str]:
     """Return recent root tags, newest first (vX.Y.Z only)."""
-    raw = subprocess.check_output(
-        ["gh", "api", f"repos/{ORG}/{repo}/tags?per_page=100", "--jq", "[.[].name]"],
-        text=True,
+    # ⚠️ 这条路径**必须**带瞬时重试：实测 2026-10-29 oekit/workflow run#79
+    # 就是死在 `gh api repos/.../tags` 的 **HTTP 504**（"We couldn't respond to
+    # your request in time"）上 ⇒ 整轮「刷新版本与健康度」直接红。
+    raw = _gh_out(
+        ["api", f"repos/{ORG}/{repo}/tags?per_page=100", "--jq", "[.[].name]"]
     )
     tags = json.loads(raw)
     root = [t for t in tags if re.fullmatch(r"v\d+\.\d+\.\d+", t)]
@@ -1550,9 +1655,8 @@ def parse_nested_tag(tag: str) -> tuple[str, str] | None:
 
 def nested_tags(repo: str) -> dict[str, list[str]]:
     """嵌套模块 tag：<仓内路径>/vX.Y.Z → {路径: [ver, ...] 新→旧}。"""
-    raw = subprocess.check_output(
-        ["gh", "api", f"repos/{ORG}/{repo}/tags?per_page=100", "--jq", "[.[].name]"],
-        text=True,
+    raw = _gh_out(
+        ["api", f"repos/{ORG}/{repo}/tags?per_page=100", "--jq", "[.[].name]"]
     )
     tags = json.loads(raw)
     out: dict[str, list[str]] = {}
@@ -1583,8 +1687,32 @@ def module_exists(title: str) -> bool:
         argv = ["gh", "api", f"repos/{ORG}/{repo}/contents/{path}"]
     else:
         argv = ["gh", "api", f"repos/{ORG}/{title}"]
-    p = subprocess.run(argv, capture_output=True, text=True)
-    return p.returncode == 0
+    # ⚠️ 这里**不能**用「非零退出码 = 不存在」的裸判断：
+    # GitHub 抖一下（502/504）时 gh 同样非零退出 ⇒ 会被读成「仓已消失」
+    # ⇒ **误删**板上还活着的行（陈旧行清理的下一步就是删它）。
+    # ⇒ 瞬时故障重试；仍失败则**抛**（读不到 ≠ 不存在），让本轮跳过清理。
+    detail = ""
+    for i in range(GH_TRIES):
+        p = subprocess.run(argv, capture_output=True, text=True)
+        if p.returncode == 0:
+            return True
+        detail = (p.stderr or p.stdout or "").strip()
+        if not _is_transient(detail):
+            # 404 = 真的不存在 ⇒ False（**不是** True）。
+            # ⚠️ 判据要写「是不是 404」再取反：直接 `return "HTTP 404" in detail`
+            #    会把「确实是 404」当成「存在」⇒ 不存在的仓被判成存在
+            #    ⇒ 陈旧行清理**永远不生效**（陈旧行永远留着）。
+            #    其它错误（403/401）也不该当成「不存在」⇒ 一律 False。
+            if "HTTP 404" in detail or "Not Found" in detail:
+                return False
+            print(f"  ! 探测 {title} 是否存在失败（非 404，也非瞬时）：{detail[:160]}",
+                  file=sys.stderr)
+            return False
+        if i + 1 < GH_TRIES:
+            time.sleep(GH_BACKOFF * (i + 1))
+    raise RuntimeError(
+        f"探测 {title} 是否存在失败（瞬时故障重试 {GH_TRIES} 次仍失败）：{detail[:200]}"
+    )
 
 
 def delete_item(pid: str, item_id: str) -> None:
@@ -1824,16 +1952,19 @@ def add_draft(pid: str, title: str, body: str = "") -> str:
 def remote_install_line(repo: str) -> str | None:
     """README go get line version, fetched from default branch."""
     try:
-        raw = subprocess.check_output(
+        # 走 _gh_out（带瞬时重试）而不是裸 check_output：GitHub 抖一下时
+        # 裸调用会把版本行静默读成「没有」⇒ 板上安装行被写成空。
+        raw = _gh_out(
             [
-                "gh", "api", f"repos/{ORG}/{repo}/readme",
+                "api", f"repos/{ORG}/{repo}/readme",
                 "--jq", ".content",
-            ],
-            text=True,
-            stderr=subprocess.DEVNULL,
+            ]
         )
     except subprocess.CalledProcessError:
         return None
+    except RuntimeError:
+        # 重试耗尽仍是瞬时故障 ⇒ 读不到 ≠ 事实为空 ⇒ 抛，别把版本行写成空
+        raise
     import base64
 
     text = base64.b64decode(raw).decode("utf-8", "replace")
@@ -2341,7 +2472,7 @@ def _bound_names(stmts: list[ast.stmt], *, deep: bool) -> set[str]:
 
 def _bound_names_of(node: ast.AST, *, deep: bool) -> set[str]:
     out: set[str] = set()
-    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
         out.add(node.name)
         if deep:
             out |= _bound_names(node.body, deep=True)
@@ -2353,6 +2484,14 @@ def _bound_names_of(node: ast.AST, *, deep: bool) -> set[str]:
                 out.add(a.vararg.arg)
             if a.kwarg:
                 out.add(a.kwarg.arg)
+        return out
+    if isinstance(node, ast.ClassDef):
+        # ⚠️ ClassDef **没有** .args（那是 FunctionDef 的属性）⇒
+        #    把 ClassDef 与 FunctionDef 混在一起处理会抛 AttributeError。
+        #    实测 2026-10-31：给本脚本加一个「类里带 visitor 方法」的检查器时
+        #    撞上它 ⇒ selftest 直接崩 ⇒ 整道门禁失效（而不是判红）。
+        #    ⇒ 类只贡献**类名**；类体内的名字不进外层作用域（Python 语义如此）。
+        out.add(node.name)
         return out
     if isinstance(node, ast.Lambda):
         if deep:
@@ -2577,6 +2716,218 @@ def _ast_call_site_finds(tree: ast.AST) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
+
+
+def _probe_gh_retry(
+    stderr: str = "gh: HTTP 502",
+    always_fail: str | None = None,
+    target: str = "_gh_out",
+    repo: str = "probe-repo",
+) -> tuple | None:
+    """造一个**假 gh** 放进临时目录，真跑一遍目标函数，统计它被调用几次。
+
+    返回 (结果, 调用次数)；若构造失败返回 None。
+
+    为什么不用 mock 打桩：这里要验的是「**进程真的被重新拉起了几次**」——
+    只测正则（`_is_transient`）证明不了调用路径真的走了重试。
+    假 gh 是 PATH 前置的一个小脚本，靠一个计数文件记录调用次数。
+
+    三种场景：
+      - 默认：第 1 次吐 502、第 2 次吐 `OK` ⇒ 期望调用 2 次并成功；
+      - stderr=…404：永远吐 404 ⇒ 期望只调用 1 次（真错不重试）；
+      - always_fail=…：永远吐该错误 ⇒ 期望调用 GH_TRIES 次并抛错。
+
+    target 选被调函数：
+      - `_gh_out`：通用出口（列 tag / 搜 issue / 读 README 等）；
+      - `_gh_run`：GraphQL 通道（gql() / gh_json() 都走它）——
+        **2026-10-29 oekit/data run#228 死在它的 502 上** ⇒ 必须单独钉住；
+      - `latest_tags` / `module_exists`：曾经绕过重试路径的两个真实调用点。
+    """
+    import os
+    import shutil
+    import tempfile
+
+    tmp = tempfile.mkdtemp(prefix="gh-retry-probe-")
+    try:
+        counter = Path(tmp) / "calls"
+        # 假 gh：第一次失败（之后成功）；always_fail 模式下永远失败。
+        # 计数文件用 shell 自增（不依赖 gh 本身）。
+        # ⚠️ always_fail 必须渲染成**空串**而不是 Python 的 "None"：
+        #    f-string 会把 None 写成字符串 "None" ⇒ 判据 `[ -n "None" ]` 恒真
+        #    ⇒ 假 gh 永远失败 ⇒ 探针静默测的是「重试耗尽」而不是「重试后成功」。
+        fail_always = always_fail or ""
+        body = f"""#!/bin/sh
+n=0
+if [ -f "{counter}" ]; then n=$(cat "{counter}"); fi
+n=$((n+1))
+echo "$n" > "{counter}"
+if [ -n "{fail_always}" ]; then
+  echo '{fail_always}' >&2
+  exit 1
+fi
+if [ "$n" = "1" ]; then
+  echo '{stderr}' >&2
+  exit 1
+fi
+if [ "$1" = "api" ] && [ "$2" = "graphql" ]; then
+  echo '{{"data":{{"ok":true}}}}'
+elif echo "$2" | grep -q 'tags'; then
+  echo '["v1.2.3"]'
+elif echo "$2" | grep -q 'readme'; then
+  echo 'eA=='
+elif echo "$2" | grep -q '^repos/'; then
+  echo '{{"node_id":"NID","content":"eA=="}}'
+else
+  echo OK
+fi
+"""
+        fake = Path(tmp) / "gh"
+        fake.write_text(body, encoding="utf-8")
+        fake.chmod(0o755)
+
+        old_path = os.environ.get("PATH", "")
+        os.environ["PATH"] = f"{tmp}{os.pathsep}{old_path}"
+        old_backoff = globals()["GH_BACKOFF"]
+        globals()["GH_BACKOFF"] = 0.01      # 别让自测真的睡 6 秒
+        raised = False
+        out: object = ""
+        try:
+            if target == "_gh_out":
+                out = _gh_out(["api", "probe"])
+            elif target == "_gh_run":
+                out = _gh_run(["api", "graphql", "-f", "query={x}"])
+            elif target == "latest_tags":
+                out = latest_tags(repo)
+            elif target == "module_exists":
+                out = module_exists(repo)
+            else:
+                return None
+        except Exception:
+            raised = True
+        finally:
+            globals()["GH_BACKOFF"] = old_backoff
+            os.environ["PATH"] = old_path
+        calls = int(counter.read_text().strip()) if counter.exists() else 0
+        if always_fail:
+            return (raised, calls)
+        return (out, calls)
+    except Exception:
+        return None
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def _probe_module_exists_404() -> object:
+    """假 gh 永远吐 404 ⇒ 跑 module_exists ⇒ 回它的**返回值**。
+
+    返回 True/False；构造失败返回 None。
+
+    为什么单独一个探针：404 的语义是「不存在」⇒ 必须回 False。
+    这条判据有区分力：把 `return "HTTP 404" in detail` 写成
+    「命中 404 就返回 True」⇒ 不存在的仓被判成存在 ⇒ 判据立刻转红。
+    """
+    import os
+    import shutil
+    import tempfile
+
+    tmp = tempfile.mkdtemp(prefix="gh-404-probe-")
+    try:
+        fake = Path(tmp) / "gh"
+        fake.write_text(
+            "#!/bin/sh\n"
+            "echo 'gh: Not Found (HTTP 404)' >&2\n"
+            "exit 1\n",
+            encoding="utf-8",
+        )
+        fake.chmod(0o755)
+        old_path = os.environ.get("PATH", "")
+        os.environ["PATH"] = f"{tmp}{os.pathsep}{old_path}"
+        try:
+            return module_exists("no-such-repo-probe")
+        except Exception:
+            return None
+        finally:
+            os.environ["PATH"] = old_path
+    except Exception:
+        return None
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def _gh_call_sites_without_retry(tree: ast.AST) -> list[str]:
+    """找出**绕过重试路径**的 gh 调用点。
+
+    判据：函数体里出现 `subprocess.check_output([...gh...])` 或
+    `subprocess.run([...gh...])`（且不在 `_gh_run` / `_gh_out` / `module_exists`
+    这三个已自带重试的函数体内）⇒ 报出来。
+
+    为什么需要这道：2026-10-29 的两次红里，有一次（oekit/workflow run#79）
+    死在 `latest_tags` 的**裸 check_output** 上 —— 只修 `_gh_run` 根本碰不到它。
+    ⇒ 这类「漏网的裸调用」必须被机械地钉住，否则下一个新函数又会绕过。
+    """
+    findings: list[str] = []
+    for owner, node in _iter_functions(tree):
+        if owner in _RETRY_SAFE_FUNCS:
+            continue
+        for call in ast.walk(node):
+            if not isinstance(call, ast.Call):
+                continue
+            name = getattr(call.func, "attr", None)
+            if name not in ("check_output", "run", "Popen"):
+                continue
+            argv = _argv_literals(call)
+            if argv and argv[0] == "gh":
+                findings.append(
+                    f"{owner}() 里的 subprocess.{name} 直调 gh（绕过了重试路径）"
+                )
+    return findings
+
+
+# 三个自带重试的函数（判据要放行它们自己内部的 subprocess 调用）。
+_RETRY_SAFE_FUNCS = {"_gh_run", "_gh_out", "module_exists", "gh_auth_ready"}
+
+
+def _argv_literals(call: ast.Call) -> list[str] | None:
+    """取 subprocess.* 第一个参数（argv 列表）里的字符串字面量。
+
+    非字面量元素记成 "?"——只用于判断 argv[0] 是不是 gh。
+    """
+    if not call.args:
+        return None
+    first = call.args[0]
+    if not isinstance(first, (ast.List, ast.Tuple)):
+        return None
+    out: list[str] = []
+    for el in first.elts:
+        if isinstance(el, ast.Constant) and isinstance(el.value, str):
+            out.append(el.value)
+        else:
+            out.append("?")
+    return out
+
+
+def _iter_functions(tree: ast.AST):
+    """逐个产出 (函数名, 函数节点)——含模块层函数与嵌套函数。
+
+    刻意**不用类**：本脚本的「未定义名」检查器把 ClassDef 当 FunctionDef 处理
+    （ClassDef 没有 .args）⇒ 类一出现，selftest 就会崩而不是判红
+    （2026-10-31 实测）。⇒ 这里用模块层函数实现，不引入类。
+    """
+    stack: list[str] = []
+
+    def walk(node: ast.AST) -> None:
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                stack.append(child.name)
+                yield (child.name, child)
+                for item in walk(child):
+                    yield item
+                stack.pop()
+            else:
+                for item in walk(child):
+                    yield item
+
+    yield from walk(tree)
 
 
 def selftest() -> int:
@@ -2834,6 +3185,134 @@ def f():
             fails.append(
                 "反证失败：把函数定义改名后未定义名检查没报错——检查器已失效"
             )
+
+    # 10) gh 瞬时故障重试（2026-10-29 实测：oekit/data run#228 撞 HTTP 502、
+    #     oekit/workflow run#79 撞 HTTP 504 ⇒ 整轮入板刷新红，板面停在旧值）。
+    #     判据必须能区分「瞬时（该重试）」与「真错（不该重试）」。
+    #     ⚠️ 光测正则不够——正则对了但**调用路径没走重试**也等于没修 ⇒
+    #     这里用**假 gh**（PATH 前置一个脚本）真跑一遍，数它被调用了几次。
+    transient_cases = [
+        # (gh 报错文本, 期望是否瞬时)
+        ("gh: HTTP 502", True),
+        ("gh: HTTP 504", True),
+        ("gh: HTTP 500", True),
+        ("gh: HTTP 503", True),
+        # 真实观测到的自然语言超时文案（workflow run#79 的原文）
+        ("gh: We couldn't respond to your request in time. Sorry about that. "
+         "Please try resubmitting your request and contact us if the problem "
+         "persists. (HTTP 504)", True),
+        # ⚠️ 永久错误，但正文里**混进了 5xx 样数字**（GitHub 的 GraphQL 报错
+        #    常把字段/节点 ID 回显出来）⇒ 必须按「永久」处理，不能重试。
+        #    这条是 NON_RETRYABLE_RE 存在的理由：TRANSIENT_RE 里的裸 `\b5\d\d\b`
+        #    会命中「500」这个数字 ⇒ 没有 NON_RETRYABLE 兜底就会白等 6 秒。
+        ("gh: HTTP 404: Not Found (field 500 not found)", False),
+        ("gh: HTTP 404: Not Found (HTTP 404)", False),
+        ("gh: HTTP 401: Bad credentials", False),
+        ("gh: HTTP 403: Resource not accessible by integration", False),
+        ("gh: HTTP 422: Validation Failed", False),
+        # 认证失败（dependabot 场景的经典形态）——绝不能重试
+        ("To get started with GitHub CLI, please run: gh auth login", False),
+        ("", False),
+    ]
+    for text, want in transient_cases:
+        got = _is_transient(text)
+        if got != want:
+            fails.append(
+                f"_is_transient({text[:60]!r}) = {got}，期望 {want}"
+            )
+
+    # 10b) 变异验证：**真的重试了**才算修好。
+    #      假 gh：第一次吐 502，第二次吐正常 ⇒ 必须成功返回，且被调用 2 次。
+    #      ⇒ 退回旧写法（不重试）时，第一次就抛 ⇒ 判据转红。
+    #      ⚠️ **每条出口都要单独钉**：2026-10-29 的两次红分别死在
+    #      `_gh_run`（data run#228，502）与 `latest_tags`（workflow run#79，504）
+    #      —— 只钉其中一条，另一条退回旧写法照样全绿。
+    for target in ("_gh_out", "_gh_run", "latest_tags"):
+        retry_probe = _probe_gh_retry(target=target)
+        if retry_probe is None:
+            fails.append(f"重试探针构造失败：无法在临时目录造出假 gh（{target}）")
+            continue
+        ok_out, calls = retry_probe
+        if calls != 2:
+            fails.append(
+                f"瞬时故障重试探针[{target}]：假 gh 被调用 {calls} 次，期望 2 次"
+                "（1 次 = 没重试，重试逻辑没生效）"
+            )
+        if not ok_out:
+            fails.append(f"瞬时故障重试探针[{target}]：重试后没拿到结果")
+
+    # 10c) 反向探针：**真错不该重试**（否则一次 404 要白等 6 秒）。
+    #      假 gh 永远吐 404 ⇒ 必须只被调用 1 次并抛错。
+    for target in ("_gh_out", "_gh_run", "latest_tags"):
+        no_retry_probe = _probe_gh_retry(
+            stderr="gh: HTTP 404: Not Found (HTTP 404)", target=target)
+        if no_retry_probe is None:
+            fails.append(f"重试探针构造失败：无法在临时目录造出假 gh（404/{target}）")
+            continue
+        _out, calls = no_retry_probe
+        if calls != 1:
+            fails.append(
+                f"非瞬时错误探针[{target}]：假 gh 被调用 {calls} 次，期望 1 次"
+                "（真错重试 = 白等，还把真信号埋成重试后仍失败）"
+            )
+
+    # 10d) 瞬时错误耗尽重试后**必须抛**（不能静默吞掉）——静默吞 = 板面留旧值且无人知晓。
+    exhaust_probe = _probe_gh_retry(always_fail="gh: HTTP 502")
+    if exhaust_probe is None:
+        fails.append("重试探针构造失败：无法在临时目录造出假 gh（耗尽场景）")
+    else:
+        raised, calls = exhaust_probe
+        if not raised:
+            fails.append("瞬时错误重试耗尽后没有抛错——失败被静默吞掉了")
+        if calls != GH_TRIES:
+            fails.append(
+                f"瞬时错误重试耗尽：假 gh 被调用 {calls} 次，期望 {GH_TRIES} 次"
+            )
+
+    # 10e) module_exists：**瞬时故障不得被读成「仓不存在」**，且
+    #      **404 必须被读成「不存在」**（不是「存在」）。
+    #      读成不存在 ⇒ 陈旧行清理会**删掉还活着的行**（不可逆）；
+    #      读成存在 ⇒ 陈旧行**永远清不掉**（清理功能形同虚设）。
+    mod_probe = _probe_gh_retry(always_fail="gh: HTTP 502", target="module_exists")
+    if mod_probe is None:
+        fails.append("重试探针构造失败：无法在临时目录造出假 gh（module_exists）")
+    else:
+        raised, calls = mod_probe
+        if not raised:
+            fails.append(
+                "module_exists 把瞬时故障读成了「不存在」——"
+                "这会让陈旧行清理删掉还活着的行"
+            )
+
+    # 10e2) 404 → 必须返回 False（不存在）。
+    #      假 gh 永远吐 404 ⇒ module_exists 必须答 False，**且不能抛**。
+    mod404 = _probe_gh_retry(
+        stderr="gh: Not Found (HTTP 404)", always_fail="gh: Not Found (HTTP 404)",
+        target="module_exists")
+    if mod404 is None:
+        fails.append("重试探针构造失败：无法在临时目录造出假 gh（module_exists/404）")
+    else:
+        raised, calls = mod404
+        # always_fail 模式探针只回 (raised, calls)；这里另用直接调用核对返回值
+        got = _probe_module_exists_404()
+        if got is None:
+            fails.append("module_exists(404) 探针构造失败")
+        elif got is not False:
+            fails.append(
+                f"module_exists 对 404 返回了 {got!r}，期望 False"
+                "（把「不存在」读成「存在」⇒ 陈旧行永远清不掉）"
+            )
+
+    # 10f) 静态检查：**不得有绕过重试路径的裸 gh 调用**。
+    #      这道是给「以后新写的函数」用的：新增一个用 check_output 直调 gh 的
+    #      函数 ⇒ 这里立刻红（否则又是一次「只修了一条出口」的漏网）。
+    try:
+        _probe_tree = ast.parse(Path(__file__).read_text(encoding="utf-8"))
+    except SyntaxError as exc:
+        fails.append(f"脚本自身语法错误（静态检查用）：{exc}")
+    else:
+        for msg in _gh_call_sites_without_retry(_probe_tree):
+            fails.append(msg)
 
     for f in fails:
         print(f"FAIL {f}")
