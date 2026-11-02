@@ -26,7 +26,9 @@ import argparse
 import ast
 import builtins
 import datetime
+import importlib.util
 import json
+import tempfile
 import time
 import os
 import re
@@ -610,6 +612,60 @@ def add_url(pid: str, url: str) -> str:
         """
     )
     return data["addProjectV2ItemById"]["item"]["id"]
+
+
+# ---------- 「已经在板上了」：幂等信号，不是真失败 ----------
+
+# GitHub 对「重复入板」回的是 GraphQL 错误，不是成功。
+# 两种措辞都出现过（Projects v2 的文案随时间变过）。
+_ALREADY_ON_BOARD_MARKERS = (
+    "Content already exists in this project",
+    "already added",
+)
+
+
+def is_already_on_board(exc: Exception) -> bool:
+    """这个异常是不是「这条已经在板上了」这一**幂等信号**（而不是真失败）。
+
+    为什么需要它：看板写入有**最终一致延迟**，而 `projectV2.items` 的分页读
+    **还会漏行** ⇒ 刚加进去的行可能读不到 ⇒ 脚本误判成「不在板上」⇒ 去重复添加
+    ⇒ GitHub 回 "Content already exists in this project"。
+    ⇒ 这不是错误，是「加过了」⇒ 必须当成成功，否则整轮入板被打死。
+
+    ⚠️ **只认幂等信号，不许变成吞错**：真失败（凭证错 / 权限不足 / 网络故障）
+    必须照旧抛出 ⇒ 判据只匹配上面两条文案。
+    """
+    text = str(exc)
+    return any(m in text for m in _ALREADY_ON_BOARD_MARKERS)
+
+
+def authoritative_item(url: str, project_number: int) -> dict | None:
+    """用**权威读路径**查这条在板上的行；不在板上 / 读不到 ⇒ None。
+
+    为什么不用 `projectV2.items`：那份读面**会漏行**，且看板写入有最终一致延迟
+    （2026-10-27 实测 #4 板实际 1124 行只读出 1122 行）⇒ 刚加进去的行读不到。
+    ⇒ 权威路径是 issue/PR 自己的 `projectItems`，不滞后。
+
+    读不到时返回 None 而不是抛错：**「读不到」≠「不在板上」**——
+    调用方据此可以保守地当作「需要添加」；而添加真的失败时还有幂等判定兜底。
+    """
+    try:
+        info = authoritative_items([url], project_number)
+    except Exception as exc:
+        print(f"  ! 权威复核失败（不阻塞）：{str(exc)[:200]}", file=sys.stderr)
+        return None
+    it = info.get(url)
+    if not it:
+        return None
+    return {
+        "url": url,
+        "id": it.get("item_id"),
+        "title": "",
+        "created": "",
+        "state": "",
+        "repo": "",
+        "fv": it.get("fields") or {},
+    }
 
 
 def opt_map(field: dict | None) -> dict[str, str]:
@@ -2262,11 +2318,35 @@ def link_item(url: str, state: str) -> None:
     by_url = {i["url"]: i for i in proj["items"] if i["url"]}
     item = by_url.get(url)
     if not item:
-        print(f"  + add {url}")
-        iid = add_url(proj["id"], url)
-    else:
+        # ⚠️ `projectV2.items` 的分页读**会漏行**，且看板写入有**最终一致延迟**
+        # ⇒ 刚加进去的行可能读不到 ⇒ 误判成「不在板上」⇒ 去重复添加 ⇒
+        # GitHub 回 "Content already exists in this project" ⇒ 整轮 link 抛异常。
+        # ⇒ 先走**权威读路径**（issue/PR 自己的 projectItems，不滞后）复核一次。
+        item = authoritative_item(url, proj_num)
+    if item:
         iid = item["id"]
         print(f"  = already on board {url}")
+    else:
+        print(f"  + add {url}")
+        try:
+            iid = add_url(proj["id"], url)
+            item = {"url": url, "id": iid, "fv": {}}
+        except Exception as exc:
+            if not is_already_on_board(exc):
+                raise
+            # 幂等信号：「已经在板上了」——上一次 link 已经加过，只是读面还没看到。
+            # ⇒ 再走一次权威读路径取回行 id；仍读不到就跳过本轮字段刷新
+            #   （整点全量同步会把推导列补齐）。
+            # ⚠️ **不许在这里抛异常**：那会让全 org 各仓的「即时入板」job 假红
+            # （2026-11-02 实测：oekit/oekit run#41383918665，PR「开→合」只隔 5 秒）。
+            item = authoritative_item(url, proj_num)
+            if not item:
+                print(
+                    f"  = already on board（读面滞后，跳过字段刷新）{url}",
+                    file=sys.stderr,
+                )
+                return
+            iid = item["id"]
 
     if kind == "issues":
         status_opts = opt_map(proj["fields"].get("Status"))
@@ -2930,6 +3010,165 @@ def _iter_functions(tree: ast.AST):
     yield from walk(tree)
 
 
+# ---------------------------------------------------------------------------
+# --link 路径的幂等性判据（2026-11-02）
+# ---------------------------------------------------------------------------
+
+_LINK_PROBE_URL = "https://github.com/oekit/pkg/pull/113"
+
+
+def _probe_link_item(
+    mod,
+    *,
+    board_has_row: bool,
+    add_error: str | None,
+    authoritative_row: bool,
+) -> tuple[str, dict]:
+    """在 mod 上跑一次 link_item（网络全桩）⇒ 返回 (结果, 调用计数)。
+
+    结果 ∈ {'ok', 'raised'}；调用计数用来断言「到底走了哪条路径」。
+
+    为什么需要它：看板写入有**最终一致延迟**，`projectV2.items` 的分页读还会漏行
+    ⇒ PR「开→合」只隔几秒时，第二次 link 读板面可能还看不到刚加进去的那行
+    ⇒ 误判成「不在板上」⇒ 去重复添加 ⇒ GitHub 回
+    "Content already exists in this project" ⇒ 整轮 link 抛异常、job 红了
+    （2026-11-02 实测：oekit/oekit run#41383918665）。
+    ⇒ 这道判据必须能**复刻那个现场**，并证明 link 不再因此抛异常。
+    """
+    calls = {"add": 0, "set": 0, "auth": 0}
+    url = _LINK_PROBE_URL
+
+    def fake_load_project(number):
+        return {
+            "id": "PVT_FAKE",
+            "fields": {
+                "Review": {
+                    "id": "F-REVIEW",
+                    "options": [{"id": "O-MERGED", "name": "已合入"}],
+                },
+                "Scope": {
+                    "id": "F-SCOPE",
+                    "options": [{"id": "O-FEAT", "name": "feat"}],
+                },
+            },
+            "items": [{"id": "ITEM-1", "url": url, "fv": {}}] if board_has_row else [],
+        }
+
+    def fake_gh_json(argv):
+        return {"title": "feat(shellx): add POSIX shell quoting primitive"}
+
+    def fake_add_url(pid, u):
+        calls["add"] += 1
+        if add_error:
+            raise RuntimeError(f"gh api graphql 失败（exit 1）：{add_error}")
+        return "ITEM-NEW"
+
+    def fake_set_field(pid, item_id, field_id, **kw):
+        calls["set"] += 1
+
+    def fake_authoritative_items(urls, project_number):
+        calls["auth"] += 1
+        if not authoritative_row:
+            return {}
+        return {
+            u: {"item_id": "ITEM-AUTH", "fields": {"Review": "已合入"}}
+            for u in urls
+        }
+
+    saved = {}
+    for name, fn in (
+        ("load_project", fake_load_project),
+        ("gh_json", fake_gh_json),
+        ("add_url", fake_add_url),
+        ("set_field", fake_set_field),
+        ("authoritative_items", fake_authoritative_items),
+    ):
+        saved[name] = getattr(mod, name)
+        setattr(mod, name, fn)
+    try:
+        mod.link_item(url, "merged")
+        result = "ok"
+    except Exception:
+        result = "raised"
+    finally:
+        for name, fn in saved.items():
+            setattr(mod, name, fn)
+    return result, calls
+
+
+def _link_idempotency_failures(mod) -> list[str]:
+    """--link 幂等性判据（可在**任意** module 上跑——变异自证要靠它跑变异体）。"""
+    fails: list[str] = []
+
+    # ① 幂等信号判定：认得出幂等信号，且**不把真错当幂等**
+    if not mod.is_already_on_board(
+        RuntimeError("gh: Content already exists in this project")
+    ):
+        fails.append("is_already_on_board 没认出「Content already exists in this project」")
+    if not mod.is_already_on_board(RuntimeError("already added")):
+        fails.append("is_already_on_board 没认出「already added」")
+    if mod.is_already_on_board(RuntimeError("gh: Bad credentials")):
+        fails.append("is_already_on_board 把真错当成了幂等信号（容错变成了吞错）")
+
+    # ② 现场复刻：板面读不到刚加的行、权威路径读得到 ⇒ 不该再重复添加，且不许抛
+    res, calls = _probe_link_item(
+        mod, board_has_row=False, add_error=None, authoritative_row=True
+    )
+    if res != "ok":
+        fails.append("link_item 在「板面漏读、权威路径确认在板上」时抛了异常")
+    if calls["auth"] == 0:
+        fails.append("link_item 没有走权威读路径复核 ⇒ 漏读时只能靠抛异常收场")
+    if calls["add"] != 0:
+        fails.append("link_item 在权威路径已确认在板上时仍去重复添加")
+    if calls["set"] == 0:
+        fails.append("link_item 在恢复路径上没写字段 ⇒ PR 的 Review/Scope 刷不上")
+
+    # ③ 现场复刻：板面与权威路径**都**读不到 + add_url 回 already exists ⇒ 不许抛
+    res, calls = _probe_link_item(
+        mod,
+        board_has_row=False,
+        add_error="gh: Content already exists in this project",
+        authoritative_row=False,
+    )
+    if res != "ok":
+        fails.append(
+            "link_item 在「already exists」时仍抛异常 ⇒ 全 org 各仓的「即时入板」"
+            "job 会假红（2026-11-02 实测 oekit/oekit run#41383918665）"
+        )
+
+    # ④ 真错仍必须抛（不许把容错变成吞错）
+    res, _ = _probe_link_item(
+        mod, board_has_row=False, add_error="gh: Bad credentials",
+        authoritative_row=False,
+    )
+    if res != "raised":
+        fails.append("link_item 把真错也吞了 ⇒ 容错变成了吞错")
+
+    # ⑤ 板面已可见 ⇒ 不重复添加
+    res, calls = _probe_link_item(
+        mod, board_has_row=True, add_error=None, authoritative_row=True
+    )
+    if res != "ok":
+        fails.append("link_item 在板面已可见时抛了异常")
+    if calls["add"] != 0:
+        fails.append("link_item 在板面已可见时仍去重复添加")
+
+    # ⑥ 全新条目 ⇒ 加进去并写字段
+    res, calls = _probe_link_item(
+        mod, board_has_row=False, add_error=None, authoritative_row=False
+    )
+    if res != "ok":
+        fails.append("link_item 在新增条目时抛了异常")
+    if calls["add"] != 1:
+        fails.append(
+            f"link_item 新增条目时 add_url 被调 {calls['add']} 次，期望 1 次"
+        )
+    if calls["set"] == 0:
+        fails.append("link_item 新增条目后没写字段")
+
+    return fails
+
+
 def selftest() -> int:
     """离线自测：嵌套 tag 解析 / 真相源装载 / Layer 覆盖 / 副本是否漂移。
 
@@ -3313,6 +3552,44 @@ def f():
     else:
         for msg in _gh_call_sites_without_retry(_probe_tree):
             fails.append(msg)
+
+    # 11) --link 路径的**幂等性**（2026-11-02 实测：oekit/oekit run#41383918665）
+    #     看板写入有最终一致延迟，`projectV2.items` 的分页读还会漏行 ⇒
+    #     PR「开→合」只隔几秒时，第二次 link 读板面可能还看不到刚加进去的那行
+    #     ⇒ 误判成「不在板上」⇒ 去重复添加 ⇒ GitHub 回
+    #     "Content already exists in this project" ⇒ 整轮 link 抛异常 ⇒
+    #     全 org 各仓的「即时入板」job 假红。
+    #     判据本身先跑（不是只在「绿的时候」才跑）——红的时候正是最需要它的时候。
+    fails.extend(_link_idempotency_failures(sys.modules[__name__]))
+
+    # 11b) 变异自证：把「幂等信号」的容错摘掉 ⇒ 判据必须转红。
+    #      否则这道门禁只是摆设——「判据全绿」只说明「绿的时候它会跑」。
+    _link_src = Path(__file__).read_text(encoding="utf-8")
+    _needle = "            if not is_already_on_board(exc):\n                raise\n"
+    if _needle not in _link_src:
+        fails.append(
+            "变异样本构造失败：找不到 link_item 里的幂等容错片段"
+            "（判据与实现的耦合断了 ⇒ 这道门禁已失效）"
+        )
+    else:
+        _mutant_src = _link_src.replace(_needle, "            raise\n", 1)
+        try:
+            with tempfile.TemporaryDirectory() as _td:
+                _mp = Path(_td) / "sync_projects_mutant.py"
+                _mp.write_text(_mutant_src, encoding="utf-8")
+                _spec = importlib.util.spec_from_file_location(
+                    "sync_projects_mutant", _mp)
+                _mod = importlib.util.module_from_spec(_spec)
+                _spec.loader.exec_module(_mod)
+                _mfails = _link_idempotency_failures(_mod)
+        except Exception as exc:
+            fails.append(f"变异样本构造/加载失败：{exc}")
+        else:
+            if not _mfails:
+                fails.append(
+                    "反证失败：摘掉「already exists」的容错后判据没报错——"
+                    "这道门禁没有牙齿（判据失效）"
+                )
 
     for f in fails:
         print(f"FAIL {f}")
