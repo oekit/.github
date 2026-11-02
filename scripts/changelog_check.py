@@ -6,6 +6,7 @@
   3. HEAD 恰为 tag 时（git describe --exact-match）：必须有同名小节，
      且 [Unreleased]（若存在）不得有正文。
 """
+import os
 import re
 import subprocess
 import sys
@@ -56,9 +57,32 @@ try:
 except FileNotFoundError:
     pass
 if tag:
-    # 同名小节匹配用前缀（小节行带日期后缀，如 "## [v0.13.1] — 2026-10-18"）
-    if not any(l.startswith(f"## [{tag}]") for l in lines):
-        errors.append(f"{path}: HEAD 处于 tag {tag}，但无同名小节 ## [{tag}]")
+    # ★ 嵌套模块的 CHANGELOG 按**嵌套约定**记**短名**节（`## [v0.1.3]`），
+    #   而 tag 名是**全名**（`nacosimpl/v0.1.3`）⇒ 拿 tag 名当字符串去比节标题
+    #   ⇒ **必然误判**（实测：同 commit 上有多个 tag 时，`git describe --exact-match`
+    #   **优先返回嵌套 tag 名** ⇒ 100% 命中）。
+    #   ⇒ 精确影响面 = **有独立 CHANGELOG 的嵌套模块**（实测 7 个，**全部用短名节**）；
+    #     根 CHANGELOG 记**全名**（`## [nacosimpl/v0.1.3]`）⇒ 根仓**不误判**。
+    #   ⇒ 这里按**嵌套约定自己判**：HEAD 在**本模块**的嵌套 tag 上 ⇒ 须有**短名**节；
+    #     HEAD 在**别的模块**的 tag 上 ⇒ 本文件**不适用**（跳过同名节检查）。
+    #   ⇒ 另：文件在**非 git 目录**时 `describe` 失败 ⇒ tag 为空 ⇒ 整段跳过（CI 查仓根
+    #     ⇒ 看不到这条红 ⇒ 只有本地 validate_changelog 会撞）。
+    m = re.fullmatch(r"(?:(.+)/)?(v\d+\.\d+\.\d+)", tag)
+    tag_sub, tag_ver = (m.group(1), m.group(2)) if m else (None, tag)
+    mod_dir = os.path.dirname(path)
+    if mod_dir:
+        leaf = os.path.basename(mod_dir)
+        belongs = bool(tag_sub) and (tag_sub == leaf or tag_sub.endswith("/" + leaf))
+        if belongs:
+            # 同名小节匹配用前缀（小节行带日期后缀，如 "## [v0.1.3] — 2026-11-02"）
+            if not any(l.startswith(f"## [{tag_ver}]") for l in lines):
+                errors.append(f"{path}: HEAD 处于 tag {tag}（本模块 {leaf}），"
+                              f"但无同名小节 ## [{tag_ver}]（嵌套模块按**短名**记节）")
+        # tag 属于**别的模块** ⇒ 本文件不适用 ⇒ 跳过同名节检查（Unreleased 检查仍做）
+    else:
+        # 同名小节匹配用前缀（小节行带日期后缀，如 "## [v0.13.1] — 2026-10-18"）
+        if not any(l.startswith(f"## [{tag}]") for l in lines):
+            errors.append(f"{path}: HEAD 处于 tag {tag}，但无同名小节 ## [{tag}]")
     if "Unreleased" in seen:
         u_lineno = seen["Unreleased"]
         next_sec = next((i for i, t in sections if i > u_lineno), len(lines))
