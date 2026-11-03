@@ -48,15 +48,22 @@ for lineno, title in sections:
     prev, prev_ver, prev_lineno = ver, title, lineno
 
 # 规则 3：tag 检出时同名小节 + Unreleased 无正文
-tag = ""
+# ★★ **必须取 HEAD 上的全部 tag**（`git tag --points-at HEAD`），**不能**只取
+#    `git describe --exact-match` 返回的**一个**：
+#    同一 commit 上有多个 tag 时 describe **只返回任意一个**（实测优先返回嵌套
+#    tag 名）⇒ 另一个模块的版本节**从不被校验** ⇒ 缺了也判绿（**假绿**）。
+#    实测：registry 仓 HEAD 停在 `nacos/v0.1.3` + `nacosimpl/v0.1.4` 同 commit 上
+#    ⇒ 删掉 `nacosimpl/CHANGELOG.md` 的 `## [v0.1.4]` 短名节
+#    ⇒ describe 口径判 ✓（假绿）；全 tag 口径判 ❌（真红）。
+tags = []
 try:
-    r = subprocess.run(["git", "describe", "--exact-match", "--tags", "HEAD"],
+    r = subprocess.run(["git", "tag", "--points-at", "HEAD"],
                        capture_output=True, text=True)
     if r.returncode == 0:
-        tag = r.stdout.strip()
+        tags = [t.strip() for t in r.stdout.splitlines() if t.strip()]
 except FileNotFoundError:
     pass
-if tag:
+if tags:
     # ★ 嵌套模块的 CHANGELOG 按**嵌套约定**记**短名**节（`## [v0.1.3]`），
     #   而 tag 名是**全名**（`nacosimpl/v0.1.3`）⇒ 拿 tag 名当字符串去比节标题
     #   ⇒ **必然误判**（实测：同 commit 上有多个 tag 时，`git describe --exact-match`
@@ -65,30 +72,33 @@ if tag:
     #     根 CHANGELOG 记**全名**（`## [nacosimpl/v0.1.3]`）⇒ 根仓**不误判**。
     #   ⇒ 这里按**嵌套约定自己判**：HEAD 在**本模块**的嵌套 tag 上 ⇒ 须有**短名**节；
     #     HEAD 在**别的模块**的 tag 上 ⇒ 本文件**不适用**（跳过同名节检查）。
-    #   ⇒ 另：文件在**非 git 目录**时 `describe` 失败 ⇒ tag 为空 ⇒ 整段跳过（CI 查仓根
+    #   ⇒ 另：文件在**非 git 目录**时取 tag 失败 ⇒ tag 列表为空 ⇒ 整段跳过（CI 查仓根
     #     ⇒ 看不到这条红 ⇒ 只有本地 validate_changelog 会撞）。
-    m = re.fullmatch(r"(?:(.+)/)?(v\d+\.\d+\.\d+)", tag)
-    tag_sub, tag_ver = (m.group(1), m.group(2)) if m else (None, tag)
+    # ★★ **逐个 tag 判定**（不是只判 describe 返回的那一个）⇒ 同 commit 上多个 tag 时
+    #    **每个模块都被校验到** ⇒ 上面的「假绿」不再存在。
     mod_dir = os.path.dirname(path)
-    if mod_dir:
-        leaf = os.path.basename(mod_dir)
-        belongs = bool(tag_sub) and (tag_sub == leaf or tag_sub.endswith("/" + leaf))
-        if belongs:
-            # 同名小节匹配用前缀（小节行带日期后缀，如 "## [v0.1.3] — 2026-11-02"）
-            if not any(l.startswith(f"## [{tag_ver}]") for l in lines):
-                errors.append(f"{path}: HEAD 处于 tag {tag}（本模块 {leaf}），"
-                              f"但无同名小节 ## [{tag_ver}]（嵌套模块按**短名**记节）")
-        # tag 属于**别的模块** ⇒ 本文件不适用 ⇒ 跳过同名节检查（Unreleased 检查仍做）
-    else:
-        # 同名小节匹配用前缀（小节行带日期后缀，如 "## [v0.13.1] — 2026-10-18"）
-        if not any(l.startswith(f"## [{tag}]") for l in lines):
-            errors.append(f"{path}: HEAD 处于 tag {tag}，但无同名小节 ## [{tag}]")
+    leaf = os.path.basename(mod_dir) if mod_dir else ""
+    for tag in sorted(tags):
+        m = re.fullmatch(r"(?:(.+)/)?(v\d+\.\d+\.\d+)", tag)
+        tag_sub, tag_ver = (m.group(1), m.group(2)) if m else (None, tag)
+        if mod_dir:
+            belongs = bool(tag_sub) and (tag_sub == leaf or tag_sub.endswith("/" + leaf))
+            if belongs:
+                # 同名小节匹配用前缀（小节行带日期后缀，如 "## [v0.1.3] — 2026-11-02"）
+                if not any(l.startswith(f"## [{tag_ver}]") for l in lines):
+                    errors.append(f"{path}: HEAD 处于 tag {tag}（本模块 {leaf}），"
+                                  f"但无同名小节 ## [{tag_ver}]（嵌套模块按**短名**记节）")
+            # tag 属于**别的模块** ⇒ 本文件不适用 ⇒ 跳过同名节检查（Unreleased 检查仍做）
+        else:
+            # 同名小节匹配用前缀（小节行带日期后缀，如 "## [v0.13.1] — 2026-10-18"）
+            if not any(l.startswith(f"## [{tag}]") for l in lines):
+                errors.append(f"{path}: HEAD 处于 tag {tag}，但无同名小节 ## [{tag}]")
     if "Unreleased" in seen:
         u_lineno = seen["Unreleased"]
         next_sec = next((i for i, t in sections if i > u_lineno), len(lines))
         body = [l for l in lines[u_lineno + 1:next_sec] if l.strip() and not l.startswith("## [")]
         if body:
-            errors.append(f"{path}: 已发布 {tag} 仍残留 [Unreleased] 正文（{len(body)} 行）——"
+            errors.append(f"{path}: 已发布 {sorted(tags)[0]} 仍残留 [Unreleased] 正文（{len(body)} 行）——"
                           f"版本节未定名，消费方无法归属变更")
 
 if errors:
