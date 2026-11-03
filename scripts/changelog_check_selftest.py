@@ -191,6 +191,96 @@ def main() -> int:
         check("S9", "nacos/v0.1.3" in out,
               f"报错应点名本模块的 tag，实际={out[:300]!r}")
 
+    # ═══ 2026-11-04：判据**不依赖路径参数形态**（修「绝对路径 ⇒ 根面假绿」）═══
+    #
+    # 洞的成因：规则 3 用 `os.path.dirname(path)` 是否为空来区分「根面 / 嵌套面」
+    #   ⇒ 传 `./CHANGELOG.md` 或**绝对路径**时 dirname 非空 ⇒ 误走嵌套分支
+    #   ⇒ 根面文件的「同名（全名）节」检查被**整段静默跳过** ⇒ **假绿**。
+    #   而**真实链路**（`release_train.validate_changelog` 传 `str(path)`）就是绝对路径
+    #   ⇒ CI 侧（无参调用）判红、本地预校验侧放行 ⇒ 同一份 CHANGELOG 两个结论。
+    #
+    # ⇒ 这批用例把「**三种调用形态**」都钉住：该红的都红、该绿的都绿。
+
+    # ── S10：根面 + 缺同名节 + **绝对路径** ⇒ 必须判红（★ 本次洞的正面断言）──
+    with tempfile.TemporaryDirectory() as td:
+        repo = make_repo(
+            Path(td) / "r10",
+            tags=["v0.5.3", "nacosimpl/v0.1.3"],
+            files={
+                "CHANGELOG.md": "# root\n\n## [v0.5.3] — 2026-11-02\n\n- x\n",
+                "nacosimpl/CHANGELOG.md": "## [v0.1.3] — 2026-11-02\n\n- y\n",
+            })
+        code, out = run_check(repo, str(repo / "CHANGELOG.md"))
+        check("S10", code == 1,
+              f"根面缺同名节时，**绝对路径**形态也必须判红（本次洞的正面断言），实际 exit={code}")
+        check("S10", "nacosimpl/v0.1.3" in out,
+              f"报错应点名 tag，实际={out[:200]!r}")
+
+    # ── S11：根面 + 缺同名节 + `./CHANGELOG.md` ⇒ 必须判红 ──────────────
+    with tempfile.TemporaryDirectory() as td:
+        repo = make_repo(
+            Path(td) / "r11",
+            tags=["v0.5.3", "nacosimpl/v0.1.3"],
+            files={
+                "CHANGELOG.md": "# root\n\n## [v0.5.3] — 2026-11-02\n\n- x\n",
+                "nacosimpl/CHANGELOG.md": "## [v0.1.3] — 2026-11-02\n\n- y\n",
+            })
+        code, out = run_check(repo, "./CHANGELOG.md")
+        check("S11", code == 1,
+              f"根面缺同名节时，`./CHANGELOG.md` 形态也必须判红，实际 exit={code}")
+
+    # ── S12：根面 + 同名节在位 + **绝对路径** ⇒ 放行（防「过度修正」误伤）──
+    with tempfile.TemporaryDirectory() as td:
+        repo = make_repo(
+            Path(td) / "r12",
+            tags=["v0.5.3", "nacosimpl/v0.1.3"],
+            files={
+                "CHANGELOG.md": ("# root\n\n## [v0.5.3] — 2026-11-02\n\n- x\n\n"
+                                 "## [nacosimpl/v0.1.3] — 2026-11-02\n\n- z\n"),
+                "nacosimpl/CHANGELOG.md": "## [v0.1.3] — 2026-11-02\n\n- y\n",
+            })
+        code, out = run_check(repo, str(repo / "CHANGELOG.md"))
+        check("S12", code == 0,
+              f"根面同名节在位时，绝对路径形态应放行（不能过度修正），实际 exit={code} 输出={out[:200]!r}")
+
+    # ── S13：嵌套面 + 短名节在位 + **绝对路径** ⇒ 放行（★ 无误伤）────────
+    with tempfile.TemporaryDirectory() as td:
+        repo = make_repo(
+            Path(td) / "r13",
+            tags=["v0.5.3", "nacosimpl/v0.1.3"],
+            files={
+                "CHANGELOG.md": "# root\n\n## [v0.5.3] — 2026-11-02\n\n- x\n",
+                "nacosimpl/CHANGELOG.md": "## [v0.1.3] — 2026-11-02\n\n- y\n",
+            })
+        code, out = run_check(repo, str(repo / "nacosimpl" / "CHANGELOG.md"))
+        check("S13", code == 0,
+              f"嵌套面短名节在位时，绝对路径形态应放行（不能把嵌套面误判成根面），实际 exit={code} 输出={out[:200]!r}")
+
+    # ── S14：嵌套面 + 短名节缺失 + **绝对路径** ⇒ 判红（★ 不能借修正放水）──
+    with tempfile.TemporaryDirectory() as td:
+        repo = make_repo(
+            Path(td) / "r14",
+            tags=["v0.5.3", "nacosimpl/v0.1.3"],
+            files={
+                "CHANGELOG.md": "# root\n\n## [v0.5.3] — 2026-11-02\n\n- x\n",
+                "nacosimpl/CHANGELOG.md": "# 没有版本节\n\n- y\n",
+            })
+        code, out = run_check(repo, str(repo / "nacosimpl" / "CHANGELOG.md"))
+        check("S14", code == 1,
+              f"嵌套面缺短名节时，绝对路径形态也必须判红（不能借修正放水），实际 exit={code}")
+        check("S14", "nacosimpl/v0.1.3" in out,
+              f"报错应点名 tag，实际={out[:200]!r}")
+
+    # ── S15：非 git 目录 + 绝对路径 ⇒ 放行（边界：读不到仓根 ⇒ 跳过，不误伤）──
+    with tempfile.TemporaryDirectory() as td:
+        outside = Path(td) / "outside"
+        outside.mkdir()
+        (outside / "CHANGELOG.md").write_text(
+            "## [v0.1.3] — 2026-11-02\n\n- y\n", encoding="utf-8")
+        code, out = run_check(Path(td), str(outside / "CHANGELOG.md"))
+        check("S15", code == 0,
+              f"非 git 目录下的文件应跳过规则 3（绝对路径形态），实际 exit={code} 输出={out[:200]!r}")
+
     # ── 变异自证（★）：把实现退回 `describe` 口径 ⇒ S8 必须转红
     #    ⇒ 证明 S8 这条断言**有牙齿**（不是恒绿）。
     #    ⚠️ 变异必须在断言运行期间生效 ⇒ 这里改**源码文件**（被测脚本是 subprocess
@@ -233,6 +323,58 @@ def main() -> int:
               "（旧口径判绿 ⇒ 另一模块缺短名节不被抓；新口径判红 ⇒ S8 有牙齿）")
     finally:
         SCRIPT.write_text(saved_src, encoding="utf-8")
+
+    # ── 变异自证（★★）：把「根面判定」退回旧的「看 dirname(path) 是否为空」
+    #    ⇒ S10/S11（绝对路径 / `./CHANGELOG.md` 形态的根面缺同名节）必须**转绿**
+    #    ⇒ 即「洞被复现」⇒ 证明这两条新断言**有牙齿**（不是恒绿）。
+    #    ★ 与上面那条变异互为对照：上面那条证「取 tag 口径」的牙齿，
+    #      这条证「根面判定口径」的牙齿 ⇒ 两条独立失效面各有一道断言。
+    saved_src2 = SCRIPT.read_text(encoding="utf-8")
+    old_expr = '        return os.path.realpath(path) == os.path.join(top, "CHANGELOG.md")'
+    new_expr = '        return not os.path.dirname(path)  # ← 变异：退回旧判定（看路径参数形态）'
+    mutated2 = saved_src2.replace(old_expr, new_expr)
+    if mutated2 == saved_src2:
+        print("✗ 变异自证失败：没找到根面判定表达式（代码形态已变？）")
+        return 1
+    try:
+        SCRIPT.write_text(mutated2, encoding="utf-8")
+        # S10 夹具：根面缺同名节 + 绝对路径
+        with tempfile.TemporaryDirectory() as td:
+            repo10 = make_repo(
+                Path(td) / "m10",
+                tags=["v0.5.3", "nacosimpl/v0.1.3"],
+                files={
+                    "CHANGELOG.md": "# root\n\n## [v0.5.3] — 2026-11-02\n\n- x\n",
+                    "nacosimpl/CHANGELOG.md": "## [v0.1.3] — 2026-11-02\n\n- y\n",
+                })
+            code10, out10 = run_check(repo10, str(repo10 / "CHANGELOG.md"))
+            # S11 夹具：根面缺同名节 + ./CHANGELOG.md
+            code11, out11 = run_check(repo10, "./CHANGELOG.md")
+            # 对照：嵌套面缺短名节 + 绝对路径（这个洞与根面判定无关 ⇒ 仍须判红）
+            repo14 = make_repo(
+                Path(td) / "m14",
+                tags=["v0.5.3", "nacosimpl/v0.1.3"],
+                files={
+                    "CHANGELOG.md": "# root\n\n## [v0.5.3] — 2026-11-02\n\n- x\n",
+                    "nacosimpl/CHANGELOG.md": "# 没有版本节\n\n- y\n",
+                })
+            code14, _out14 = run_check(repo14, str(repo14 / "nacosimpl" / "CHANGELOG.md"))
+        # ★ 期望：变异后 S10/S11 **变绿**（洞复现 ⇒ 旧口径看不见根面同名节缺失）
+        if code10 != 0:
+            print("✗ 变异「根面判定退回看路径形态」没有复现假绿"
+                  f"（绝对路径形态仍判红，exit={code10}）⇒ S10 证明不了这一层")
+            return 1
+        if code11 != 0:
+            print("✗ 变异「根面判定退回看路径形态」没有复现假绿"
+                  f"（./ 形态仍判红，exit={code11}）⇒ S11 证明不了这一层")
+            return 1
+        if code14 == 0:
+            print("✗ 变异后嵌套面缺短名节也判绿了 ⇒ 变异体过宽（不是精确退回旧判定）")
+            return 1
+        print("✓ 变异「根面判定退回看路径形态」复现了**假绿**"
+              "（绝对路径 / ./ 形态判绿 ⇒ 根面同名节缺失不被抓；新判定判红 ⇒ S10/S11 有牙齿）")
+    finally:
+        SCRIPT.write_text(saved_src2, encoding="utf-8")
 
     if failures:
         print("✗ changelog_check 规则 3（嵌套模块）自测未过：")
