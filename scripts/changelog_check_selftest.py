@@ -156,6 +156,84 @@ def main() -> int:
         check("S7", code == 0,
               f"HEAD 在根 tag 上时嵌套文件不适用，应放行，实际 exit={code} 输出={out[:200]!r}")
 
+    # ── S8：★ 同 commit 多个 tag，其中**另一个模块**缺短名节 ⇒ 必须判红
+    #    （★「假绿」防线：旧实现用 `git describe --exact-match` ⇒ 只返回**一个** tag
+    #      ⇒ 这个模块**从不被校验** ⇒ 缺了也判绿）
+    with tempfile.TemporaryDirectory() as td:
+        repo = make_repo(
+            Path(td) / "r8",
+            tags=["v0.5.3", "nacos/v0.1.3", "nacosimpl/v0.1.4"],
+            files={
+                "CHANGELOG.md": "# root\n\n## [v0.5.3] — 2026-11-02\n\n- x\n",
+                # nacos 的短名节**在位**
+                "nacos/CHANGELOG.md": "## [v0.1.3] — 2026-11-02\n\n- y\n",
+                # ★ nacosimpl 的短名节**缺失** ⇒ 必须被抓出来
+                "nacosimpl/CHANGELOG.md": "# 没有版本节\n\n- z\n",
+            })
+        code, out = run_check(repo, "nacosimpl/CHANGELOG.md")
+        check("S8", code == 1,
+              f"同 commit 多 tag 时，另一模块缺短名节必须判红（假绿防线），实际 exit={code}")
+        check("S8", "nacosimpl/v0.1.4" in out,
+              f"报错应点名**未被 describe 选中**的那个 tag，实际={out[:300]!r}")
+
+    # ── S9：★ 同 commit 多个 tag，**每个模块各自**都缺短名节 ⇒ 逐个报出
+    with tempfile.TemporaryDirectory() as td:
+        repo = make_repo(
+            Path(td) / "r9",
+            tags=["v0.5.3", "nacos/v0.1.3", "nacosimpl/v0.1.4"],
+            files={
+                "CHANGELOG.md": "# root\n\n## [v0.5.3] — 2026-11-02\n\n- x\n",
+                "nacos/CHANGELOG.md": "# 没有版本节\n\n- y\n",
+                "nacosimpl/CHANGELOG.md": "# 没有版本节\n\n- z\n",
+            })
+        code, out = run_check(repo, "nacos/CHANGELOG.md")
+        check("S9", code == 1, f"本模块缺短名节时必须判红，实际 exit={code}")
+        check("S9", "nacos/v0.1.3" in out,
+              f"报错应点名本模块的 tag，实际={out[:300]!r}")
+
+    # ── 变异自证（★）：把实现退回 `describe` 口径 ⇒ S8 必须转红
+    #    ⇒ 证明 S8 这条断言**有牙齿**（不是恒绿）。
+    #    ⚠️ 变异必须在断言运行期间生效 ⇒ 这里改**源码文件**（被测脚本是 subprocess
+    #       调用 ⇒ 每次运行都重新读文件 ⇒ 改动立即生效）⇒ 跑完再还原。
+    #    ⚠️ **变异必须是语义等价于旧实现**：光把 `git tag --points-at` 换成
+    #       `git describe` **不够** —— 旧代码取的是**单个** tag，而新代码把 stdout
+    #       按行拆成列表 ⇒ describe 的单行输出仍会被当成「一个 tag 的列表」⇒
+    #       行为不变 ⇒ **变异不生效**（实测踩过：第一次这样写，变异没被抓到）。
+    #       ⇒ 正确做法：换成 describe **且只取第一行**。
+    saved_src = SCRIPT.read_text(encoding="utf-8")
+    mutated = saved_src.replace(
+        'r = subprocess.run(["git", "tag", "--points-at", "HEAD"],',
+        'r = subprocess.run(["git", "describe", "--exact-match", "--tags", "HEAD"],')
+    mutated = mutated.replace(
+        'tags = [t.strip() for t in r.stdout.splitlines() if t.strip()]',
+        'tags = r.stdout.strip().splitlines()[:1]')
+    if mutated == saved_src:
+        print("✗ 变异自证失败：没找到 `git tag --points-at HEAD` 实现（代码形态已变？）")
+        return 1
+    try:
+        SCRIPT.write_text(mutated, encoding="utf-8")
+        with tempfile.TemporaryDirectory() as td:
+            repo = make_repo(
+                Path(td) / "mut",
+                tags=["v0.5.3", "nacos/v0.1.3", "nacosimpl/v0.1.4"],
+                files={
+                    "CHANGELOG.md": "# root\n\n## [v0.5.3] — 2026-11-02\n\n- x\n",
+                    "nacos/CHANGELOG.md": "## [v0.1.3] — 2026-11-02\n\n- y\n",
+                    "nacosimpl/CHANGELOG.md": "# 没有版本节\n\n- z\n",
+                })
+            code, out = run_check(repo, "nacosimpl/CHANGELOG.md")
+        # ★ **期望的是「变异后判绿（假绿）」**：变异体 = 旧实现（只校验 describe 选中的
+        #   那一个模块）⇒ 另一个模块缺短名节 ⇒ **判绿** ⇒ 这正是 **S8 要防的假绿**。
+        #   ⇒ 若变异后反而判红 ⇒ 说明旧实现也抓得到 ⇒ **S8 就不是新增防线**（断言无牙齿）。
+        if code != 0:
+            print("✗ 变异「取 tag 退回 describe（只校验一个模块）」**没有复现假绿**"
+                  f"（变异后仍判红，exit={code}）⇒ S8 证明不了「旧口径漏检」这一层")
+            return 1
+        print("✓ 变异「取 tag 退回 describe（只校验一个模块）」复现了**假绿**"
+              "（旧口径判绿 ⇒ 另一模块缺短名节不被抓；新口径判红 ⇒ S8 有牙齿）")
+    finally:
+        SCRIPT.write_text(saved_src, encoding="utf-8")
+
     if failures:
         print("✗ changelog_check 规则 3（嵌套模块）自测未过：")
         for f in failures:
@@ -163,7 +241,8 @@ def main() -> int:
         return 1
     print("✓ changelog_check 规则 3（嵌套模块）自测通过："
           "嵌套短名节在位⇒放行 / 短名节缺失⇒判红 / 根记全名⇒放行 / 根缺同名节⇒判红 / "
-          "别的模块 tag⇒不适用 / 非 git 目录⇒跳过 / 根 tag⇒不适用")
+          "别的模块 tag⇒不适用 / 非 git 目录⇒跳过 / 根 tag⇒不适用 / "
+          "同 commit 多 tag⇒每个模块都被校验（假绿防线）")
     return 0
 
 

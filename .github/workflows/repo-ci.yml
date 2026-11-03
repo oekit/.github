@@ -58,6 +58,28 @@ jobs:
           python3 scripts/board_query.py --help >/dev/null
           python3 scripts/board_query.py --selftest
 
+  # changelog_check 规则 3 的自测：**只在本仓跑**（规则本体在本仓，
+  # 别仓只是调用它 ⇒ 自测跟着本体走）。
+  #
+  # 为什么必须有：规则 3 是「HEAD 处于 tag 时必须有同名小节」的判据，
+  # 而它的判定依赖 `git` 的 tag 解析行为 ⇒ **`describe` 返回几个 tag、
+  # 返回哪一个**，都是**沉默的失败面**（不报错、只是不判）。
+  # ⇒ 判据一旦被改弱（例如从「取全部 tag」退回「取 describe 返回的那一个」），
+  # **CI 不会红**（org CI 只查仓根 CHANGELOG ⇒ 看不到嵌套模块）⇒ 只有自测能抓住。
+  selftest:
+    name: Selftest
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      # 变异自证：把取 tag 的实现退回旧口径（只取 describe 返回的那一个）
+      # ⇒ 必须**复现假绿**（另一模块缺短名节不被抓）⇒ 否则这条断言没有牙齿。
+      - name: changelog_check 规则 3 自测（嵌套模块判定 + 多 tag 假绿防线 + 变异自证）
+        run: python3 scripts/changelog_check_selftest.py
+
   # 本体/副本 pin 一致性门禁：**只在本仓跑**（别的仓没有 workflow-templates/，
   # 挂进共享 python-ci.yml 会让它们误红）。
   #
