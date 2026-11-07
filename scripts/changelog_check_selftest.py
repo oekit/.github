@@ -281,6 +281,82 @@ def main() -> int:
         check("S15", code == 0,
               f"非 git 目录下的文件应跳过规则 3（绝对路径形态），实际 exit={code} 输出={out[:200]!r}")
 
+    # ── S12（#61 形态 1）：两个版本标题**粘连在同一行** ⇒ 必须判红 ──
+    #    旧切节（行首锚定 match）只取行首第一个 ⇒ 第二个标题既不切节也不判重
+    #    ⇒ 假绿（concurrency CHANGELOG.md:219 实测）。
+    with tempfile.TemporaryDirectory() as td:
+        repo = make_repo(
+            Path(td) / "r12",
+            tags=[],
+            files={"CHANGELOG.md": (
+                "# c\n\n## [Unreleased]\n\n- w\n\n"
+                "## [v0.15.0] — 2026-10-18## [v0.15.0] — 2026-10-18\n\n- x\n\n"
+                "## [v0.14.0] — 2026-10-01\n\n- y\n")},
+            )
+        code, out = run_check(repo, "CHANGELOG.md")
+        check("S12", code == 1, f"同行粘连标题必须判红，实际 exit={code} 输出={out[:200]!r}")
+        check("S12", "格式损坏" in out, f"粘连应报「格式损坏」，实际={out[:200]!r}")
+
+    # ── S13（#61 形态 2）：版本标题**跨行断裂**（] 被甩到下一行）⇒ 必须判红 ──
+    #    旧切节对断裂行 match 失败 ⇒ 整节连同版本号从门禁视野消失。
+    with tempfile.TemporaryDirectory() as td:
+        repo = make_repo(
+            Path(td) / "r13",
+            tags=[],
+            files={"CHANGELOG.md": (
+                "# c\n\n## [Unreleased]\n\n- w\n\n"
+                "## [- feat(singleflight): add\nv0.7.0] — 2026-10-18\n\n- x\n\n"
+                "## [v0.6.0] — 2026-09-01\n\n- y\n")},
+            )
+        code, out = run_check(repo, "CHANGELOG.md")
+        check("S13", code == 1, f"跨行断裂标题必须判红，实际 exit={code} 输出={out[:200]!r}")
+        check("S13", "格式损坏" in out, f"断裂应报「格式损坏」，实际={out[:200]!r}")
+
+    # ── S14（对照）：正常日期后缀 + 正文行含 `## [` 字样但**不在行首** ⇒ 放行 ──
+    with tempfile.TemporaryDirectory() as td:
+        repo = make_repo(
+            Path(td) / "r14",
+            tags=[],
+            files={"CHANGELOG.md": (
+                "# c\n\n## [Unreleased]\n\n- 修 changelog-check（见 .github#61：`## [` 行首锚定）\n\n"
+                "## [v0.15.0] — 2026-10-18\n\n- x\n\n"
+                "## [v0.14.0] — 2026-10-01\n\n- y\n")},
+            )
+        code, out = run_check(repo, "CHANGELOG.md")
+        check("S14", code == 0, f"正文提及标题语法不应误报，实际 exit={code} 输出={out[:200]!r}")
+
+    # ── 变异自证（#61）：切节退回行首锚定 match ⇒ S12 必须**转绿（假绿复现）**
+    saved_src61 = SCRIPT.read_text(encoding="utf-8")
+    mutated61 = saved_src61.replace(
+        "    for m in head_re.finditer(l):\n"
+        "        sections.append((i, m.group(1).strip()))",
+        "    if (m := head_re.match(l)):  # ← 变异：退回行首锚定（只取每行第一个）\n"
+        "        sections.append((i, m.group(1).strip()))")
+    mutated61 = mutated61.replace(
+        'if l.startswith("## [") and (TITLE_LINE_RE.fullmatch(l) is None or l.count("## [") != 1):',
+        'if False and l.startswith("## ["):  # ← 变异：硬规则一并退役')
+    if mutated61 == saved_src61:
+        print("✗ 变异自证失败：没找到 finditer 切节实现（代码形态已变？）")
+        return 1
+    try:
+        SCRIPT.write_text(mutated61, encoding="utf-8")
+        with tempfile.TemporaryDirectory() as td:
+            repo = make_repo(
+                Path(td) / "mut61",
+                tags=[],
+                files={"CHANGELOG.md": (
+                    "# c\n\n## [Unreleased]\n\n- w\n\n"
+                    "## [v0.15.0] — 2026-10-18## [v0.15.0] — 2026-10-18\n\n- x\n\n"
+                    "## [v0.14.0] — 2026-10-01\n\n- y\n")},
+                )
+            code, out = run_check(repo, "CHANGELOG.md")
+        if code != 0:
+            print("✗ 变异「切节退回行首锚定」没有复现假绿（变异后仍判红）⇒ S12 证明不了旧口径漏检")
+            return 1
+        print("✓ 变异「切节退回行首锚定」复现了假绿（旧口径判绿 ⇒ 粘连标题不被抓；新口径判红 ⇒ S12/S13 有牙齿）")
+    finally:
+        SCRIPT.write_text(saved_src61, encoding="utf-8")
+
     # ── 变异自证（★）：把实现退回 `describe` 口径 ⇒ S8 必须转红
     #    ⇒ 证明 S8 这条断言**有牙齿**（不是恒绿）。
     #    ⚠️ 变异必须在断言运行期间生效 ⇒ 这里改**源码文件**（被测脚本是 subprocess
