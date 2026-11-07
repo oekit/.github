@@ -19,8 +19,25 @@ except FileNotFoundError:
     print(f"[changelog-check] {path} 不存在，跳过")
     sys.exit(0)
 
-sec_pat = re.compile(r"^## \[([^\]]+)\]")
 ver_pat = re.compile(r"^v\d+\.\d+\.\d+$")
+
+# ★★ 切节改为**枚举行内全部标题**（oekit/.github#61）：行首锚定的 match 只取
+#    每行第一个 ⇒「两个版本标题粘连在同一行」时第二个既不被切节也不被判重
+#    ⇒ 门禁存在结构性假绿通道（concurrency CHANGELOG.md:219 实测）。
+head_re = re.compile(r"## \[([^\]]+)\]")
+sections = []
+for i, l in enumerate(lines):
+    for m in head_re.finditer(l):
+        sections.append((i, m.group(1).strip()))
+
+# ★★ 版本标题必须**整行独占**（#61 第 2 形态）：行首是 `## [` 的行必须恰好
+#    整行是一个标题——fullmatch 抓「] 被甩到下一行」的断裂形态，
+#    count==1 抓「第二个 ## [ 粘在同一行」的粘连形态（fullmatch 的 `.*`
+#    后缀会吞掉粘连尾部，所以两条判据缺一不可）。
+TITLE_LINE_RE = re.compile(r"## \[[^\]]+\](?: — .*)?")
+for i, l in enumerate(lines):
+    if l.startswith("## [") and (TITLE_LINE_RE.fullmatch(l) is None or l.count("## [") != 1):
+        errors.append(f"{path}:{i + 1}: 版本标题行格式损坏（标题粘连或跨行断裂）: {l[:60]!r}")
 
 
 def _is_root_changelog(path: str) -> bool:
@@ -63,9 +80,6 @@ def _is_root_changelog(path: str) -> bool:
     except OSError:
         return False
 
-sections = [(i, m.group(1).strip()) for i, l in enumerate(lines) if (m := sec_pat.match(l))]
-
-# 规则 2：完整标题不得重复
 seen = {}
 for lineno, title in sections:
     if title in seen:
@@ -76,9 +90,9 @@ for lineno, title in sections:
 # 规则 1：主模块版本节（标题恰为 vX.Y.Z）严格递减
 prev = None
 prev_lineno = 0
-for lineno, title in sections:
-    if title == "Unreleased":
-        if sections.index((lineno, title)) != 0:
+for _idx, (lineno, title) in enumerate(sections):   # 枚举索引：index() 在同名
+    if title == "Unreleased":                        # tuple 重复时取第一个（#61）
+        if _idx != 0:
             errors.append(f"{path}:{lineno + 1}: [Unreleased] 只允许出现在最顶部")
         continue
     if not ver_pat.match(title):
@@ -134,14 +148,14 @@ if tags:
         if not is_root_file:
             belongs = bool(tag_sub) and (tag_sub == leaf or tag_sub.endswith("/" + leaf))
             if belongs:
-                # 同名小节匹配用前缀（小节行带日期后缀，如 "## [v0.1.3] — 2026-11-02"）
-                if not any(l.startswith(f"## [{tag_ver}]") for l in lines):
+                # 同名小节匹配用切节标题集合（断裂形态对旧 startswith 不可见，#61）
+                if not any(t == tag_ver for _, t in sections):
                     errors.append(f"{path}: HEAD 处于 tag {tag}（本模块 {leaf}），"
                                   f"但无同名小节 ## [{tag_ver}]（嵌套模块按**短名**记节）")
             # tag 属于**别的模块** ⇒ 本文件不适用 ⇒ 跳过同名节检查（Unreleased 检查仍做）
         else:
-            # 同名小节匹配用前缀（小节行带日期后缀，如 "## [v0.13.1] — 2026-10-18"）
-            if not any(l.startswith(f"## [{tag}]") for l in lines):
+            # 同名小节匹配用切节标题集合（断裂形态对旧 startswith 不可见，#61）
+            if not any(t == tag for _, t in sections):
                 errors.append(f"{path}: HEAD 处于 tag {tag}，但无同名小节 ## [{tag}]")
     if "Unreleased" in seen:
         u_lineno = seen["Unreleased"]
