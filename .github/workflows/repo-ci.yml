@@ -79,6 +79,12 @@ jobs:
       # ⇒ 必须**复现假绿**（另一模块缺短名节不被抓）⇒ 否则这条断言没有牙齿。
       - name: changelog_check 规则 3 自测（嵌套模块判定 + 多 tag 假绿防线 + 变异自证）
         run: python3 scripts/changelog_check_selftest.py
+      # 版本行门禁的自测：假 origin（本地路径远端，真 ls-remote 不 mock）+ 假工作仓
+      # ⇒ 警告模式/strict 模式、跳过形态、判等谓词的变异自证都要在此钉住。
+      # 这道门禁缺自测的后果很隐蔽：它防的本来就是「绿灯下版本行漂移」，
+      # 判据静默失效时它照样绿灯——只有自测能在哑掉时红出来。
+      - name: version_line_check 自测（tag 一致性判定 + 跳过形态 + 变异自证）
+        run: python3 scripts/version_line_check_selftest.py
 
   # 本体/副本 pin 一致性门禁：**只在本仓跑**（别的仓没有 workflow-templates/，
   # 挂进共享 python-ci.yml 会让它们误红）。
