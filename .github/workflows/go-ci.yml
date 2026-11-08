@@ -166,8 +166,34 @@ jobs:
       - name: Check CHANGELOG/tag consistency
         # .github#6：主模块版本节严格递减无重复、[Unreleased] 只允许最顶部一个、
         # tag 检出时必须有同名小节且 [Unreleased] 无正文——消费方做 0.x minor
-        # breaking 评估只能靠 CHANGELOG，一致性即对外契约
-        run: python3 org-ci/scripts/changelog_check.py
+        # breaking 评估只能靠 CHANGELOG，一致性即对外契约。
+        # .github#63：从「只查根面 CHANGELOG.md」改为**遍历仓内全部 CHANGELOG.md
+        # 逐个校验**——无参调用只会落到根面，4 个仓 7 个嵌套模块的 changelog
+        # 规则（严格递减 / 无重复 / tag 同名小节）在 CI 里是零强制的死代码。
+        # 根面文件与嵌套文件的判据差异（全名 vs 短名节）由脚本内部按 git toplevel
+        # 自行区分（.github#59），调用方只管把每个文件都喂进来。
+        run: |
+          set -euo pipefail
+          found=0
+          fail=0
+          while IFS= read -r f; do
+            found=1
+            echo "::group::changelog-check ${f#./}"
+            if ! python3 org-ci/scripts/changelog_check.py "$f"; then
+              fail=1
+            fi
+            echo "::endgroup::"
+          done < <(find . -name CHANGELOG.md -not -path './.git/*' -not -path './org-ci/*' | sort)
+          [ "$found" -eq 1 ] || echo "仓内无 CHANGELOG.md，跳过"
+          exit "$fail"
+
+      - name: Check version lines vs latest tag
+        # .github#64：README 安装行 / AGENTS 当前版本行必须等于远端最新 vX.Y.Z tag
+        # （「发版 → 打 tag → 同步版本行」的后置同步此前无任何强制，7 仓 main 落后）。
+        # 当前为**警告模式**（落后输出 ⚠ 不挡合并）：2026-11-08 全矩阵还有版本行
+        # 漂移，先立规矩不挡路；等 refresh_versions 轮把全矩阵 ⚠ 清零后，把下面
+        # 的调用行加上 --strict 即切硬门禁（切换条件跟踪见 oekit/.github#64）。
+        run: python3 org-ci/scripts/version_line_check.py
 
       - name: golangci-lint
         uses: golangci/golangci-lint-action@v9
