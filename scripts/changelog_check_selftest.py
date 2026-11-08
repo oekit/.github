@@ -325,10 +325,32 @@ def main() -> int:
         code, out = run_check(repo, "CHANGELOG.md")
         check("S14", code == 0, f"正文提及标题语法不应误报，实际 exit={code} 输出={out[:200]!r}")
 
+    # ── S15：正文反引号引用节名（`## [v0.1.4]`）不算节——不误报重复/递减 ──
+    #    finditer 切节（#61 修复）的副作用面：正文大量引用节名的 CHANGELOG
+    #    （matrix-tools 实测）会被假节污染 ⇒ 排除 prev 为反引号/空白的匹配。
+    with tempfile.TemporaryDirectory() as td:
+        repo = make_repo(
+            Path(td) / "r15",
+            tags=[],
+            files={"CHANGELOG.md": (
+                "# c\n\n## [v0.2.0] — 2026-11-03\n\n"
+                "- 正文引用旧节名：删掉 `## [v0.1.4]` ⇒ 判 ✓（假绿形态描述），另见 ## [Unreleased] 规则\n\n"
+                "## [v0.1.4] — 2026-10-20\n\n- x\n")},
+            )
+        code, out = run_check(repo, "CHANGELOG.md")
+        check("S15", code == 0, f"正文引用节名不应误报，实际 exit={code} 输出={out[:200]!r}")
+
     # ── 变异自证（#61）：切节退回行首锚定 match ⇒ S12 必须**转绿（假绿复现）**
     saved_src61 = SCRIPT.read_text(encoding="utf-8")
     mutated61 = saved_src61.replace(
         "    for m in head_re.finditer(l):\n"
+        "        # 正文里反引号引用的节名（`## [v0.1.4]`）与行中散排引用（空格后跟 ## [）\n"
+        "        # 不是标题——只有「行首」与「同行粘连（前一字符非反引号/空白）」两种形态算节。\n"
+        "        # 粘连形态（#61）前一字符是普通文本（如日期数字），必须保留；反引号引用\n"
+        "        # （matrix-tools CHANGELOG 正文大量存在）必须排除，否则整文件假节污染。\n"
+        "        prev = l[m.start() - 1] if m.start() > 0 else \"\"\n"
+        "        if prev in (\"`\", \" \", \"\\t\"):\n"
+        "            continue\n"
         "        sections.append((i, m.group(1).strip()))",
         "    if (m := head_re.match(l)):  # ← 变异：退回行首锚定（只取每行第一个）\n"
         "        sections.append((i, m.group(1).strip()))")
