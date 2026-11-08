@@ -28,6 +28,13 @@ head_re = re.compile(r"## \[([^\]]+)\]")
 sections = []
 for i, l in enumerate(lines):
     for m in head_re.finditer(l):
+        # 正文里反引号引用的节名（`## [v0.1.4]`）与行中散排引用（空格后跟 ## [）
+        # 不是标题——只有「行首」与「同行粘连（前一字符非反引号/空白）」两种形态算节。
+        # 粘连形态（#61）前一字符是普通文本（如日期数字），必须保留；反引号引用
+        # （matrix-tools CHANGELOG 正文大量存在）必须排除，否则整文件假节污染。
+        prev = l[m.start() - 1] if m.start() > 0 else ""
+        if prev in ("`", " ", "\t"):
+            continue
         sections.append((i, m.group(1).strip()))
 
 # ★★ 版本标题必须**整行独占**（#61 第 2 形态）：行首是 `## [` 的行必须恰好
